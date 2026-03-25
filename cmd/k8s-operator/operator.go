@@ -100,6 +100,7 @@ func main() {
 		isDefaultLoadBalancer = defaultBool("OPERATOR_DEFAULT_LOAD_BALANCER", false)
 		loginServer           = strings.TrimSuffix(defaultEnv("OPERATOR_LOGIN_SERVER", ""), "/")
 		ingressClassName      = defaultEnv("OPERATOR_INGRESS_CLASS_NAME", "tailscale")
+		secretNamespaces      = splitNamespaces(defaultEnv("OPERATOR_SECRET_NAMESPACES", ""))
 	)
 
 	var opts []kzap.Opts
@@ -160,6 +161,7 @@ func main() {
 		tsServer:                      s,
 		tsClient:                      tsc,
 		tailscaleNamespace:            tsNamespace,
+		secretNamespaces:              secretNamespaces,
 		restConfig:                    restConfig,
 		proxyImage:                    image,
 		k8sProxyImage:                 k8sProxyImage,
@@ -290,14 +292,18 @@ func serviceManagedResourceFilterPredicate() predicate.Predicate {
 // ServiceReconciler. It blocks forever.
 func runReconcilers(opts reconcilerOpts) {
 	startlog := opts.log.Named("startReconcilers")
-	// For secrets and statefulsets, we only get permission to touch the objects
-	// in the controller's own namespace. This cannot be expressed by
+	// For most namespaced resources, we only get permission to touch the
+	// objects in the controller's own namespace. This cannot be expressed by
 	// .Watches(...) below, instead you have to add a per-type field selector to
 	// the cache that sits a few layers below the builder stuff, which will
 	// implicitly filter what parts of the world the builder code gets to see at
 	// all.
 	nsFilter := cache.ByObject{
 		Field: client.InNamespace(opts.tailscaleNamespace).AsSelector(),
+	}
+	secretNamespaces := watchedSecretNamespaces(opts.tailscaleNamespace, opts.secretNamespaces)
+	secretFilter := cache.ByObject{
+		Namespaces: secretNamespaces,
 	}
 
 	// We watch the ServiceMonitor CRD to ensure that reconcilers are re-triggered if user's workflows result in the
@@ -316,7 +322,7 @@ func runReconcilers(opts reconcilerOpts) {
 		// Other object types (e.g., EndpointSlices) can still be fetched or watched using the cached client, but they will not have any filtering applied.
 		Cache: cache.Options{
 			ByObject: map[client.Object]cache.ByObject{
-				&corev1.Secret{}:                            nsFilter,
+				&corev1.Secret{}:                            secretFilter,
 				&corev1.ServiceAccount{}:                    nsFilter,
 				&corev1.Pod{}:                               nsFilter,
 				&corev1.ConfigMap{}:                         nsFilter,
@@ -765,11 +771,39 @@ func runReconcilers(opts reconcilerOpts) {
 	}
 }
 
+func splitNamespaces(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	namespaces := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		namespaces = append(namespaces, part)
+	}
+	return namespaces
+}
+
+func watchedSecretNamespaces(operatorNamespace string, extraNamespaces []string) map[string]cache.Config {
+	namespaces := map[string]cache.Config{operatorNamespace: {}}
+	for _, ns := range extraNamespaces {
+		if ns == "" {
+			continue
+		}
+		namespaces[ns] = cache.Config{}
+	}
+	return namespaces
+}
+
 type reconcilerOpts struct {
 	log                *zap.SugaredLogger
 	tsServer           *tsnet.Server
 	tsClient           tsClient
 	tailscaleNamespace string       // namespace in which operator resources will be deployed
+	secretNamespaces   []string     // extra namespaces whose Secrets should be cached by the operator
 	restConfig         *rest.Config // config for connecting to the kube API server
 	proxyImage         string       // <proxy-image-repo>:<proxy-image-tag>
 	k8sProxyImage      string       // <k8s-proxy-image-repo>:<k8s-proxy-image-tag>

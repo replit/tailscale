@@ -21,6 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -33,6 +34,29 @@ import (
 	"tailscale.com/util/dnsname"
 	"tailscale.com/util/mak"
 )
+
+func TestWatchedSecretNamespaces(t *testing.T) {
+	t.Run("operator namespace only by default", func(t *testing.T) {
+		got := watchedSecretNamespaces("tailscale", nil)
+		want := map[string]cache.Config{"tailscale": {}}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("watchedSecretNamespaces mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("adds trimmed extra namespaces and de-dupes", func(t *testing.T) {
+		extra := splitNamespaces(" zergrush-system , staging-zergrush-system, tailscale ,, zergrush-system ")
+		got := watchedSecretNamespaces("tailscale", extra)
+		want := map[string]cache.Config{
+			"tailscale":               {},
+			"zergrush-system":         {},
+			"staging-zergrush-system": {},
+		}
+		if diff := cmp.Diff(want, got); diff != "" {
+			t.Fatalf("watchedSecretNamespaces mismatch (-want +got):\n%s", diff)
+		}
+	})
+}
 
 func TestLoadBalancerClass(t *testing.T) {
 	fc := fake.NewFakeClient()
