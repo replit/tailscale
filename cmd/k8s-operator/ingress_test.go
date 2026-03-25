@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"reflect"
+	"strings"
 	"testing"
 
 	"go.uber.org/zap"
@@ -26,6 +27,7 @@ import (
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
+	"tailscale.com/types/ptr"
 	"tailscale.com/util/mak"
 )
 
@@ -57,7 +59,21 @@ func TestTailscaleIngress(t *testing.T) {
 
 	expectReconciled(t, ingR, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
+	secretList := &corev1.SecretList{}
+	if err := fc.List(t.Context(), secretList, client.InNamespace("operator-ns"), client.MatchingLabels(childResourceLabels("test", "default", "ingress"))); err != nil {
+		t.Fatalf("listing generated secrets: %v", err)
+	}
+	fullName := ""
+	for _, secret := range secretList.Items {
+		if strings.HasSuffix(secret.Name, "-0") {
+			fullName = secret.Name
+			break
+		}
+	}
+	if fullName == "" {
+		t.Fatalf("failed to find generated state Secret among %v", secretList.Items)
+	}
+	shortName := strings.TrimSuffix(fullName, "-0")
 	opts := configOpts{
 		replicas:   new(int32(1)),
 		stsName:    shortName,
@@ -286,7 +302,21 @@ func TestTailscaleIngressWithProxyClass(t *testing.T) {
 
 	expectReconciled(t, ingR, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
+	secretList := &corev1.SecretList{}
+	if err := fc.List(t.Context(), secretList, client.InNamespace("operator-ns"), client.MatchingLabels(childResourceLabels("test", "default", "ingress"))); err != nil {
+		t.Fatalf("listing generated secrets: %v", err)
+	}
+	fullName := ""
+	for _, secret := range secretList.Items {
+		if strings.HasSuffix(secret.Name, "-0") {
+			fullName = secret.Name
+			break
+		}
+	}
+	if fullName == "" {
+		t.Fatalf("failed to find generated state Secret among %v", secretList.Items)
+	}
+	shortName := strings.TrimSuffix(fullName, "-0")
 	opts := configOpts{
 		stsName:    shortName,
 		secretName: fullName,
@@ -388,7 +418,21 @@ func TestTailscaleIngressWithServiceMonitor(t *testing.T) {
 		logger: zl.Sugar(),
 	}
 	expectReconciled(t, ingR, "default", "test")
-	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
+	secretList := &corev1.SecretList{}
+	if err := fc.List(t.Context(), secretList, client.InNamespace("operator-ns"), client.MatchingLabels(childResourceLabels("test", "default", "ingress"))); err != nil {
+		t.Fatalf("listing generated secrets: %v", err)
+	}
+	fullName := ""
+	for _, secret := range secretList.Items {
+		if strings.HasSuffix(secret.Name, "-0") {
+			fullName = secret.Name
+			break
+		}
+	}
+	if fullName == "" {
+		t.Fatalf("failed to find generated state Secret among %v", secretList.Items)
+	}
+	shortName := strings.TrimSuffix(fullName, "-0")
 	opts := configOpts{
 		stsName:            shortName,
 		secretName:         fullName,
@@ -871,7 +915,21 @@ func TestTailscaleIngressWithHTTPRedirect(t *testing.T) {
 
 	expectReconciled(t, ingR, "default", "test")
 
-	fullName, shortName := findGenName(t, fc, "default", "test", "ingress")
+	secretList := &corev1.SecretList{}
+	if err := fc.List(t.Context(), secretList, client.InNamespace("operator-ns"), client.MatchingLabels(childResourceLabels("test", "default", "ingress"))); err != nil {
+		t.Fatalf("listing generated secrets: %v", err)
+	}
+	fullName := ""
+	for _, secret := range secretList.Items {
+		if strings.HasSuffix(secret.Name, "-0") {
+			fullName = secret.Name
+			break
+		}
+	}
+	if fullName == "" {
+		t.Fatalf("failed to find generated state Secret among %v", secretList.Items)
+	}
+	shortName := strings.TrimSuffix(fullName, "-0")
 	opts := configOpts{
 		replicas:   new(int32(1)),
 		stsName:    shortName,
@@ -997,6 +1055,101 @@ func TestTailscaleIngressWithAcceptAppCaps(t *testing.T) {
 	expectEqual(t, fc, expectedSecret(t, fc, opts))
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
 	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
+}
+
+func TestTailscaleIngressWithCustomTLSSecret(t *testing.T) {
+	fc := fake.NewFakeClient(ingressClass())
+	ft := &fakeTSClient{}
+	fakeTsnetServer := &fakeTSNetServer{}
+	zl, err := zap.NewDevelopment()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingR := &IngressReconciler{
+		Client:           fc,
+		ingressClassName: "tailscale",
+		ssr: &tailscaleSTSReconciler{
+			Client:            fc,
+			tsClient:          ft,
+			tsnetServer:       fakeTsnetServer,
+			defaultTags:       []string{"tag:k8s"},
+			operatorNamespace: "operator-ns",
+			proxyImage:        "tailscale/tailscale",
+		},
+		logger: zl.Sugar(),
+	}
+
+	ing := ingress()
+	ing.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{"zerg.zergrush.dev"}, SecretName: "wildcard-cert"}}
+	srcTLS := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "wildcard-cert", Namespace: "default"},
+		Type:       corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       []byte("fake-cert"),
+			corev1.TLSPrivateKeyKey: []byte("fake-key"),
+		},
+	}
+	mustCreate(t, fc, ing)
+	mustCreate(t, fc, service())
+	mustCreate(t, fc, srcTLS)
+
+	expectReconciled(t, ingR, "default", "test")
+
+	secretList := &corev1.SecretList{}
+	if err := fc.List(t.Context(), secretList, client.InNamespace("operator-ns"), client.MatchingLabels(childResourceLabels("test", "default", "ingress"))); err != nil {
+		t.Fatalf("listing generated secrets: %v", err)
+	}
+	fullName := ""
+	for _, secret := range secretList.Items {
+		if strings.HasSuffix(secret.Name, "-0") {
+			fullName = secret.Name
+			break
+		}
+	}
+	if fullName == "" {
+		t.Fatalf("failed to find generated state Secret among %v", secretList.Items)
+	}
+	shortName := strings.TrimSuffix(fullName, "-0")
+	opts := configOpts{
+		replicas:      ptr.To[int32](1),
+		stsName:       shortName,
+		secretName:    fullName,
+		namespace:     "default",
+		parentType:    "ingress",
+		hostname:      "zerg",
+		app:           kubetypes.AppIngressResource,
+		certShareMode: "rw",
+		serveConfig: &ipn.ServeConfig{
+			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
+			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"zerg.zergrush.dev:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
+			},
+		},
+	}
+
+	expectEqual(t, fc, expectedSecret(t, fc, opts))
+	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
+	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
+	expectEqual(t, fc, managedTLSSecret("zerg.zergrush.dev", "operator-ns", childResourceLabels("test", "default", "ingress"), srcTLS))
+
+	mustUpdate(t, fc, "operator-ns", fullName, func(secret *corev1.Secret) {
+		mak.Set(&secret.Data, "device_id", []byte("1234"))
+		mak.Set(&secret.Data, "device_fqdn", []byte("zerg.tailnetxyz.ts.net"))
+	})
+	expectReconciled(t, ingR, "default", "test")
+
+	expectedIngress := ingress()
+	expectedIngress.Spec.TLS = []networkingv1.IngressTLS{{Hosts: []string{"zerg.zergrush.dev"}, SecretName: "wildcard-cert"}}
+	expectedIngress.Finalizers = append(expectedIngress.Finalizers, "tailscale.com/finalizer")
+	expectedIngress.Status.LoadBalancer = networkingv1.IngressLoadBalancerStatus{
+		Ingress: []networkingv1.IngressLoadBalancerIngress{{
+			Hostname: "zerg.zergrush.dev",
+			Ports:    []networkingv1.IngressPortStatus{{Port: 443, Protocol: "TCP"}},
+		}},
+	}
+	expectEqual(t, fc, expectedIngress)
 }
 
 func TestParseAcceptAppCaps(t *testing.T) {

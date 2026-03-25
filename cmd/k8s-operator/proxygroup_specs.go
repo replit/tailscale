@@ -64,7 +64,7 @@ func pgNodePortService(pg *tsapi.ProxyGroup, name string, namespace string) *cor
 
 // Returns the base StatefulSet definition for a ProxyGroup. A ProxyClass may be
 // applied over the top after.
-func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string, port *uint16, proxyClass *tsapi.ProxyClass) (*appsv1.StatefulSet, error) {
+func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string, port *uint16, proxyClass *tsapi.ProxyClass, customTLS bool) (*appsv1.StatefulSet, error) {
 	if pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer {
 		return kubeAPIServerStatefulSet(pg, namespace, image, port)
 	}
@@ -243,14 +243,21 @@ func pgStatefulSet(pg *tsapi.ProxyGroup, namespace, image, tsFirewallMode string
 					Name:  "TS_SERVE_CONFIG",
 					Value: fmt.Sprintf("/etc/proxies/%s", serveConfigKey),
 				},
-				corev1.EnvVar{
+			)
+			if customTLS {
+				envs = append(envs, corev1.EnvVar{
+					Name:  "TS_CERT_SHARE_MODE",
+					Value: "rw",
+				})
+			} else {
+				envs = append(envs, corev1.EnvVar{
 					// Run proxies in cert share mode to
 					// ensure that only one TLS cert is
 					// issued for an HA Ingress.
 					Name:  "TS_EXPERIMENTAL_CERT_SHARE",
 					Value: "true",
-				},
-			)
+				})
+			}
 		}
 		return append(c.Env, envs...)
 	}()

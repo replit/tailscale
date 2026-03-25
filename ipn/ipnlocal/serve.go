@@ -1297,9 +1297,14 @@ func (b *LocalBackend) webServerConfig(hostname string, forVIPService tailcfg.Se
 		return c, false
 	}
 	if forVIPService != "" {
+		key := ipn.HostPort(net.JoinHostPort(hostname, fmt.Sprintf("%d", port)))
+		if cfg, ok := b.serveConfig.FindServiceWeb(forVIPService, key); ok {
+			return cfg, true
+		}
+
 		magicDNSSuffix := b.currentNode().NetMap().MagicDNSSuffix()
 		fqdn := strings.Join([]string{forVIPService.WithoutPrefix(), magicDNSSuffix}, ".")
-		key := ipn.HostPort(net.JoinHostPort(fqdn, fmt.Sprintf("%d", port)))
+		key = ipn.HostPort(net.JoinHostPort(fqdn, fmt.Sprintf("%d", port)))
 		return b.serveConfig.FindServiceWeb(forVIPService, key)
 	}
 	key := ipn.HostPort(net.JoinHostPort(hostname, fmt.Sprintf("%d", port)))

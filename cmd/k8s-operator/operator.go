@@ -425,6 +425,7 @@ func runReconcilers(opts reconcilerOpts) {
 		Named("ingress-reconciler").
 		Watches(&appsv1.StatefulSet{}, ingressChildFilter).
 		Watches(&corev1.Secret{}, ingressChildFilter).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(ingressesFromTLSSecret(mgr.GetClient(), startlog, opts.ingressClassName, false))).
 		Watches(&corev1.Service{}, svcHandlerForIngress).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForIngress).
 		Complete(&IngressReconciler{
@@ -440,6 +441,9 @@ func runReconcilers(opts reconcilerOpts) {
 	}
 	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(networkingv1.Ingress), indexIngressProxyClass, indexProxyClass); err != nil {
 		startlog.Fatalf("failed setting up ProxyClass indexer for Ingresses: %v", err)
+	}
+	if err := mgr.GetFieldIndexer().IndexField(context.Background(), new(networkingv1.Ingress), indexIngressTLSSecret, indexTLSSecretName); err != nil {
+		startlog.Fatalf("failed setting up TLS Secret indexer for Ingresses: %v", err)
 	}
 
 	lc, err := opts.tsServer.LocalClient()
@@ -457,6 +461,7 @@ func runReconcilers(opts reconcilerOpts) {
 		Named("ingress-pg-reconciler").
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(serviceHandlerForIngressPG(mgr.GetClient(), startlog, opts.ingressClassName))).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(HAIngressesFromSecret(mgr.GetClient(), startlog))).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(ingressesFromTLSSecret(mgr.GetClient(), startlog, opts.ingressClassName, true))).
 		Watches(&tsapi.ProxyGroup{}, ingressProxyGroupFilter).
 		Complete(&HAIngressReconciler{
 			recorder:         eventRecorder,

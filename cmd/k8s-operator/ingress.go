@@ -164,13 +164,22 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	gaugeIngressResources.Set(int64(a.managedIngresses.Len()))
 	a.mu.Unlock()
 
-	if !IsHTTPSEnabledOnTailnet(a.ssr.tsnetServer) {
+	customTLS, err := customTLSForIngress(ctx, a.Client, ing)
+	if err != nil {
+		return fmt.Errorf("failed to configure custom TLS for ingress: %w", err)
+	}
+
+	if customTLS == nil && !IsHTTPSEnabledOnTailnet(a.ssr.tsnetServer) {
 		a.recorder.Event(ing, corev1.EventTypeWarning, "HTTPSNotEnabled", "HTTPS is not enabled on the tailnet; ingress may not work")
 	}
 
 	// magic443 is a fake hostname that we can use to tell containerboot to swap
 	// out with the real hostname once it's known.
-	const magic443 = "${TS_CERT_DOMAIN}:443"
+	httpsEndpoint := "${TS_CERT_DOMAIN}"
+	if customTLS != nil {
+		httpsEndpoint = customTLS.host
+	}
+	host443 := ipn.HostPort(httpsEndpoint + ":443")
 	sc := &ipn.ServeConfig{
 		TCP: map[uint16]*ipn.TCPPortHandler{
 			443: {
@@ -178,18 +187,18 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			},
 		},
 		Web: map[ipn.HostPort]*ipn.WebServerConfig{
-			magic443: {
+			host443: {
 				Handlers: map[string]*ipn.HTTPHandler{},
 			},
 		},
 	}
 	if opt.Bool(ing.Annotations[AnnotationFunnel]).EqualBool(true) {
 		sc.AllowFunnel = map[ipn.HostPort]bool{
-			magic443: true,
+			host443: true,
 		}
 	}
 
-	web := sc.Web[magic443]
+	web := sc.Web[host443]
 
 	var tlsHost string // hostname or FQDN or empty
 	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
@@ -208,15 +217,15 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 
 	if isHTTPRedirectEnabled(ing) {
 		logger.Infof("HTTP redirect enabled, setting up port 80 redirect handlers")
-		const magic80 = "${TS_CERT_DOMAIN}:80"
+		host80 := ipn.HostPort(httpsEndpoint + ":80")
 		sc.TCP[80] = &ipn.TCPPortHandler{HTTP: true}
-		sc.Web[magic80] = &ipn.WebServerConfig{
+		sc.Web[host80] = &ipn.WebServerConfig{
 			Handlers: map[string]*ipn.HTTPHandler{},
 		}
-		if sc.AllowFunnel != nil && sc.AllowFunnel[magic443] {
-			sc.AllowFunnel[magic80] = true
+		if sc.AllowFunnel != nil && sc.AllowFunnel[host443] {
+			sc.AllowFunnel[host80] = true
 		}
-		web80 := sc.Web[magic80]
+		web80 := sc.Web[host80]
 		for mountPoint := range handlers {
 			// We send a 301 - Moved Permanently redirect from HTTP to HTTPS
 			redirectURL := "301:https://${HOST}${REQUEST_URI}"
@@ -228,6 +237,11 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	}
 
 	crl := childResourceLabels(ing.Name, ing.Namespace, "ingress")
+	if customTLS != nil {
+		if err := ensureManagedTLSSecret(ctx, a.Client, customTLS.host, a.ssr.operatorNamespace, crl, customTLS.secret); err != nil {
+			return fmt.Errorf("failed to ensure managed custom TLS Secret: %w", err)
+		}
+	}
 	var tags []string
 	if tstr, ok := ing.Annotations[AnnotationTags]; ok {
 		tags = strings.Split(tstr, ",")
@@ -245,6 +259,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ProxyClassName:      proxyClass,
 		proxyType:           proxyTypeIngressResource,
 		LoginServer:         a.ssr.loginServer,
+		CertShareMode:       ingressCertShareMode(customTLS != nil),
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
@@ -259,19 +274,28 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	if err != nil {
 		return fmt.Errorf("failed to retrieve Ingress HTTPS endpoint status: %w", err)
 	}
+	hasHTTPS := customTLS == nil
+	if customTLS != nil {
+		hasHTTPS = true
+	}
 
 	ing.Status.LoadBalancer.Ingress = nil
 	for _, dev := range devices {
-		if dev.ingressDNSName == "" {
+		if dev.ingressDNSName == "" && customTLS == nil {
 			continue
 		}
 
-		logger.Debugf("setting Ingress hostname to %q", dev.ingressDNSName)
-		ports := []networkingv1.IngressPortStatus{
-			{
+		hostname := dev.ingressDNSName
+		if customTLS != nil {
+			hostname = customTLS.host
+		}
+		logger.Debugf("setting Ingress hostname to %q", hostname)
+		ports := []networkingv1.IngressPortStatus{}
+		if hasHTTPS {
+			ports = append(ports, networkingv1.IngressPortStatus{
 				Protocol: "TCP",
 				Port:     443,
-			},
+			})
 		}
 		if isHTTPRedirectEnabled(ing) {
 			ports = append(ports, networkingv1.IngressPortStatus{
@@ -280,7 +304,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			})
 		}
 		ing.Status.LoadBalancer.Ingress = append(ing.Status.LoadBalancer.Ingress, networkingv1.IngressLoadBalancerIngress{
-			Hostname: dev.ingressDNSName,
+			Hostname: hostname,
 			Ports:    ports,
 		})
 	}

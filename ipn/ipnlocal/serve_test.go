@@ -529,6 +529,64 @@ func TestServeConfigServices(t *testing.T) {
 	}
 }
 
+func TestServeConfigServicesCustomHost(t *testing.T) {
+	b := newTestBackend(t)
+	svcIPMapJSON, err := json.Marshal(tailcfg.ServiceIPMappings{
+		"svc:foo": {netip.MustParseAddr("100.101.101.101")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.currentNode().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{
+			Name: "example.ts.net",
+			CapMap: tailcfg.NodeCapMap{
+				tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
+			},
+		}).View(),
+	})
+
+	conf := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			"svc:foo": {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					443: {HTTPS: true},
+				},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.example.com:443": {
+						Handlers: map[string]*ipn.HTTPHandler{
+							"/": {Text: "ok"},
+						},
+					},
+				},
+			},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	req := &http.Request{
+		Host: "foo.example.com",
+		URL:  &url.URL{Path: "/"},
+		TLS:  &tls.ConnectionState{ServerName: "foo.example.com"},
+	}
+	req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+		ForVIPService: "svc:foo",
+		DestPort:      443,
+		SrcAddr:       netip.MustParseAddrPort("100.64.0.1:12345"),
+	}))
+
+	w := httptest.NewRecorder()
+	b.serveWebHandler(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("got status %d, want %d", w.Code, http.StatusOK)
+	}
+	if body := strings.TrimSpace(w.Body.String()); body != "ok" {
+		t.Fatalf("got body %q, want %q", body, "ok")
+	}
+}
+
 func TestServeConfigETag(t *testing.T) {
 	b := newTestBackend(t)
 

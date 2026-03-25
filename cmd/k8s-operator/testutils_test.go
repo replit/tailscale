@@ -72,6 +72,7 @@ type configOpts struct {
 	secretExtraData                                map[string][]byte
 	resourceVersion                                string
 	replicas                                       *int32
+	certShareMode                                  string
 	enableMetrics                                  bool
 	serviceMonitorLabels                           tsapi.Labels
 }
@@ -180,6 +181,9 @@ func expectedSTS(t *testing.T, cl client.Client, opts configOpts) *appsv1.Statef
 		})
 		tsContainer.VolumeMounts = append(tsContainer.VolumeMounts, corev1.VolumeMount{Name: "serve-config-0", ReadOnly: true, MountPath: path.Join("/etc/tailscaled", opts.secretName)})
 	}
+	if opts.certShareMode != "" {
+		tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{Name: "TS_CERT_SHARE_MODE", Value: opts.certShareMode})
+	}
 	tsContainer.Env = append(tsContainer.Env, corev1.EnvVar{
 		Name:  "TS_INTERNAL_APP",
 		Value: opts.app,
@@ -279,21 +283,28 @@ func expectedSTSUserspace(t *testing.T, cl client.Client, opts configOpts) *apps
 	if err != nil {
 		t.Fatal(err)
 	}
+	envs := []corev1.EnvVar{
+		{Name: "TS_USERSPACE", Value: "true"},
+		{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "status.podIP"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
+		{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "metadata.name"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
+		{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "metadata.uid"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
+		{Name: "TS_KUBE_SECRET", Value: "$(POD_NAME)"},
+		{Name: "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", Value: "false"},
+		{Name: "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR", Value: "/etc/tsconfig/$(POD_NAME)"},
+		{Name: "TS_DEBUG_ACME_FORCE_RENEWAL", Value: "true"},
+	}
+	if opts.certShareMode != "" {
+		envs = append(envs, corev1.EnvVar{Name: "TS_CERT_SHARE_MODE", Value: opts.certShareMode})
+	}
+	envs = append(envs,
+		corev1.EnvVar{Name: "TS_SERVE_CONFIG", Value: "/etc/tailscaled/$(POD_NAME)/serve-config"},
+		corev1.EnvVar{Name: "TS_INTERNAL_APP", Value: opts.app},
+	)
+
 	tsContainer := corev1.Container{
-		Name:  "tailscale",
-		Image: "tailscale/tailscale",
-		Env: []corev1.EnvVar{
-			{Name: "TS_USERSPACE", Value: "true"},
-			{Name: "POD_IP", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "status.podIP"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
-			{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "metadata.name"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
-			{Name: "POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{APIVersion: "", FieldPath: "metadata.uid"}, ResourceFieldRef: nil, ConfigMapKeyRef: nil, SecretKeyRef: nil}},
-			{Name: "TS_KUBE_SECRET", Value: "$(POD_NAME)"},
-			{Name: "TS_EXPERIMENTAL_SERVICE_AUTO_ADVERTISEMENT", Value: "false"},
-			{Name: "TS_EXPERIMENTAL_VERSIONED_CONFIG_DIR", Value: "/etc/tsconfig/$(POD_NAME)"},
-			{Name: "TS_DEBUG_ACME_FORCE_RENEWAL", Value: "true"},
-			{Name: "TS_SERVE_CONFIG", Value: "/etc/tailscaled/$(POD_NAME)/serve-config"},
-			{Name: "TS_INTERNAL_APP", Value: opts.app},
-		},
+		Name:            "tailscale",
+		Image:           "tailscale/tailscale",
+		Env:             envs,
 		ImagePullPolicy: "Always",
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: "tailscaledconfig-0", ReadOnly: true, MountPath: path.Join("/etc/tsconfig", opts.secretName)},
