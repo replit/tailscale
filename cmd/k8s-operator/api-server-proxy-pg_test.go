@@ -181,7 +181,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	expectedCfg.APIServerProxy.ServiceName = new(tailcfg.ServiceName("svc:" + pgName))
 	expectCfg(&expectedCfg)
 
-	expectEqual(t, fc, certSecret(pgName, ns, defaultDomain, pg, nil))
+	expectEqual(t, fc, certSecret(pgName, ns, defaultDomain, pg))
 	expectEqual(t, fc, certSecretRole(pgName, ns, defaultDomain))
 	expectEqual(t, fc, certSecretRoleBinding(pg, ns, defaultDomain))
 
@@ -243,7 +243,7 @@ func TestAPIServerProxyReconciler(t *testing.T) {
 	pg.Status.URL = ""
 	expectEqual(t, fc, pg, omitPGStatusConditionMessages)
 
-	expectEqual(t, fc, certSecret(pgName, ns, updatedDomain, pg, nil))
+	expectEqual(t, fc, certSecret(pgName, ns, updatedDomain, pg))
 	expectEqual(t, fc, certSecretRole(pgName, ns, updatedDomain))
 	expectEqual(t, fc, certSecretRoleBinding(pg, ns, updatedDomain))
 	expectMissing[corev1.Secret](t, fc, ns, defaultDomain)

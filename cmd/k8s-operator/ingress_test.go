@@ -1111,28 +1111,33 @@ func TestTailscaleIngressWithCustomTLSSecret(t *testing.T) {
 	}
 	shortName := strings.TrimSuffix(fullName, "-0")
 	opts := configOpts{
-		replicas:      ptr.To[int32](1),
-		stsName:       shortName,
-		secretName:    fullName,
-		namespace:     "default",
-		parentType:    "ingress",
-		hostname:      "zerg",
-		app:           kubetypes.AppIngressResource,
-		certShareMode: "rw",
+		replicas:   ptr.To[int32](1),
+		stsName:    shortName,
+		secretName: fullName,
+		namespace:  "default",
+		parentType: "ingress",
+		hostname:   "zerg",
+		app:        kubetypes.AppIngressResource,
 		serveConfig: &ipn.ServeConfig{
 			TCP: map[uint16]*ipn.TCPPortHandler{443: {HTTPS: true}},
 			Web: map[ipn.HostPort]*ipn.WebServerConfig{
+				"${TS_CERT_DOMAIN}:443": {Handlers: map[string]*ipn.HTTPHandler{
+					"/": {Proxy: "http://1.2.3.4:8080/"},
+				}},
 				"zerg.zergrush.dev:443": {Handlers: map[string]*ipn.HTTPHandler{
 					"/": {Proxy: "http://1.2.3.4:8080/"},
 				}},
 			},
+		},
+		secretExtraData: map[string][]byte{
+			"zerg.zergrush.dev.crt": []byte("fake-cert"),
+			"zerg.zergrush.dev.key": []byte("fake-key"),
 		},
 	}
 
 	expectEqual(t, fc, expectedSecret(t, fc, opts))
 	expectEqual(t, fc, expectedHeadlessService(shortName, "ingress"))
 	expectEqual(t, fc, expectedSTSUserspace(t, fc, opts), removeResourceReqs)
-	expectEqual(t, fc, managedTLSSecret("zerg.zergrush.dev", "operator-ns", childResourceLabels("test", "default", "ingress"), srcTLS))
 
 	mustUpdate(t, fc, "operator-ns", fullName, func(secret *corev1.Secret) {
 		mak.Set(&secret.Data, "device_id", []byte("1234"))

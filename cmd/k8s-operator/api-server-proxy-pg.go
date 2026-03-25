@@ -331,7 +331,7 @@ func (r *KubeAPIServerTSServiceReconciler) deleteFinalizer(ctx context.Context, 
 }
 
 func (r *KubeAPIServerTSServiceReconciler) ensureCertResources(ctx context.Context, pg *tsapi.ProxyGroup, domain string) error {
-	secret := certSecret(pg.Name, r.tsNamespace, domain, pg, nil)
+	secret := certSecret(pg.Name, r.tsNamespace, domain, pg)
 	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, secret, func(s *corev1.Secret) {
 		s.Labels = secret.Labels
 	}); err != nil {

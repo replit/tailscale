@@ -1231,21 +1231,6 @@ func TestProxyGroupTypes(t *testing.T) {
 		}
 	})
 
-	t.Run("ingress_type_custom_tls", func(t *testing.T) {
-		pg := &tsapi.ProxyGroup{
-			ObjectMeta: metav1.ObjectMeta{Name: "test-ingress-custom", UID: "test-ingress-custom-uid"},
-			Spec:       tsapi.ProxyGroupSpec{Type: tsapi.ProxyGroupTypeIngress, Replicas: new(int32(0))},
-		}
-		sts, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", nil, nil, true)
-		if err != nil {
-			t.Fatalf("pgStatefulSet(custom tls) failed: %v", err)
-		}
-		verifyEnvVar(t, sts, "TS_INTERNAL_APP", kubetypes.AppProxyGroupIngress)
-		verifyEnvVar(t, sts, "TS_SERVE_CONFIG", "/etc/proxies/serve-config.json")
-		verifyEnvVar(t, sts, "TS_CERT_SHARE_MODE", "rw")
-		verifyEnvVarNotPresent(t, sts, "TS_EXPERIMENTAL_CERT_SHARE")
-	})
-
 	t.Run("kubernetes_api_server_type", func(t *testing.T) {
 		pg := &tsapi.ProxyGroup{
 			ObjectMeta: metav1.ObjectMeta{
@@ -1973,7 +1958,7 @@ func expectProxyGroupResources(t *testing.T, fc client.WithWatch, pg *tsapi.Prox
 	role := pgRole(pg, tsNamespace)
 	roleBinding := pgRoleBinding(pg, tsNamespace)
 	serviceAccount := pgServiceAccount(pg, tsNamespace)
-	statefulSet, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", nil, proxyClass, false)
+	statefulSet, err := pgStatefulSet(pg, tsNamespace, testProxyImage, "auto", nil, proxyClass)
 	if err != nil {
 		t.Fatal(err)
 	}

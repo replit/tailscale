@@ -173,32 +173,24 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		a.recorder.Event(ing, corev1.EventTypeWarning, "HTTPSNotEnabled", "HTTPS is not enabled on the tailnet; ingress may not work")
 	}
 
-	// magic443 is a fake hostname that we can use to tell containerboot to swap
-	// out with the real hostname once it's known.
-	httpsEndpoint := "${TS_CERT_DOMAIN}"
-	if customTLS != nil {
-		httpsEndpoint = customTLS.host
-	}
-	host443 := ipn.HostPort(httpsEndpoint + ":443")
+	httpsHosts := ingressHTTPSHosts("${TS_CERT_DOMAIN}", customTLS)
 	sc := &ipn.ServeConfig{
 		TCP: map[uint16]*ipn.TCPPortHandler{
 			443: {
 				HTTPS: true,
 			},
 		},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{
-			host443: {
-				Handlers: map[string]*ipn.HTTPHandler{},
-			},
-		},
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{},
+	}
+	for _, host := range httpsHosts {
+		sc.Web[ipn.HostPort(host+":443")] = &ipn.WebServerConfig{Handlers: map[string]*ipn.HTTPHandler{}}
 	}
 	if opt.Bool(ing.Annotations[AnnotationFunnel]).EqualBool(true) {
-		sc.AllowFunnel = map[ipn.HostPort]bool{
-			host443: true,
+		sc.AllowFunnel = map[ipn.HostPort]bool{}
+		for _, host := range httpsHosts {
+			sc.AllowFunnel[ipn.HostPort(host+":443")] = true
 		}
 	}
-
-	web := sc.Web[host443]
 
 	var tlsHost string // hostname or FQDN or empty
 	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
@@ -208,40 +200,33 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	if err != nil {
 		return fmt.Errorf("failed to get handlers for ingress: %w", err)
 	}
-	web.Handlers = handlers
-	if len(web.Handlers) == 0 {
+	if len(handlers) == 0 {
 		logger.Warn("Ingress contains no valid backends")
 		a.recorder.Eventf(ing, corev1.EventTypeWarning, "NoValidBackends", "no valid backends")
 		return nil
 	}
+	for _, host := range httpsHosts {
+		sc.Web[ipn.HostPort(host+":443")].Handlers = handlers
+	}
 
 	if isHTTPRedirectEnabled(ing) {
 		logger.Infof("HTTP redirect enabled, setting up port 80 redirect handlers")
-		host80 := ipn.HostPort(httpsEndpoint + ":80")
 		sc.TCP[80] = &ipn.TCPPortHandler{HTTP: true}
-		sc.Web[host80] = &ipn.WebServerConfig{
-			Handlers: map[string]*ipn.HTTPHandler{},
-		}
-		if sc.AllowFunnel != nil && sc.AllowFunnel[host443] {
-			sc.AllowFunnel[host80] = true
-		}
-		web80 := sc.Web[host80]
-		for mountPoint := range handlers {
-			// We send a 301 - Moved Permanently redirect from HTTP to HTTPS
-			redirectURL := "301:https://${HOST}${REQUEST_URI}"
-			logger.Debugf("Creating redirect handler: %s -> %s", mountPoint, redirectURL)
-			web80.Handlers[mountPoint] = &ipn.HTTPHandler{
-				Redirect: redirectURL,
+		for _, host := range httpsHosts {
+			host80 := ipn.HostPort(host + ":80")
+			sc.Web[host80] = &ipn.WebServerConfig{Handlers: map[string]*ipn.HTTPHandler{}}
+			if sc.AllowFunnel != nil {
+				sc.AllowFunnel[host80] = true
+			}
+			for mountPoint := range handlers {
+				redirectURL := "301:https://${HOST}${REQUEST_URI}"
+				logger.Debugf("Creating redirect handler: %s -> %s", mountPoint, redirectURL)
+				sc.Web[host80].Handlers[mountPoint] = &ipn.HTTPHandler{Redirect: redirectURL}
 			}
 		}
 	}
 
 	crl := childResourceLabels(ing.Name, ing.Namespace, "ingress")
-	if customTLS != nil {
-		if err := ensureManagedTLSSecret(ctx, a.Client, customTLS.host, a.ssr.operatorNamespace, crl, customTLS.secret); err != nil {
-			return fmt.Errorf("failed to ensure managed custom TLS Secret: %w", err)
-		}
-	}
 	var tags []string
 	if tstr, ok := ing.Annotations[AnnotationTags]; ok {
 		tags = strings.Split(tstr, ",")
@@ -259,7 +244,9 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		ProxyClassName:      proxyClass,
 		proxyType:           proxyTypeIngressResource,
 		LoginServer:         a.ssr.loginServer,
-		CertShareMode:       ingressCertShareMode(customTLS != nil),
+	}
+	if customTLS != nil {
+		sts.CustomTLSCerts = map[string]*corev1.Secret{customTLS.host: customTLS.secret}
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {

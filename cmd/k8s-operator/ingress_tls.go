@@ -13,11 +13,11 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
+	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/util/mak"
 )
@@ -65,41 +65,6 @@ func ingressHTTPSHost(ing *networkingv1.Ingress, defaultHost string) string {
 	return defaultHost
 }
 
-func managedTLSSecret(name, namespace string, labels map[string]string, source *corev1.Secret) *corev1.Secret {
-	managedLabels := make(map[string]string, len(labels)+1)
-	for key, value := range labels {
-		managedLabels[key] = value
-	}
-	managedLabels[kubetypes.LabelSecretType] = kubetypes.LabelSecretTypeCerts
-
-	managed := &corev1.Secret{
-		TypeMeta: metav1.TypeMeta{
-			APIVersion: "v1",
-			Kind:       "Secret",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
-			Labels:    managedLabels,
-		},
-		Type: corev1.SecretTypeTLS,
-	}
-	if source != nil {
-		managed.Data = map[string][]byte{
-			corev1.TLSCertKey:       append([]byte(nil), source.Data[corev1.TLSCertKey]...),
-			corev1.TLSPrivateKeyKey: append([]byte(nil), source.Data[corev1.TLSPrivateKeyKey]...),
-		}
-	}
-	return managed
-}
-
-func ingressCertShareMode(customTLS bool) string {
-	if customTLS {
-		return "rw"
-	}
-	return ""
-}
-
 func hasTLSSecretData(ctx context.Context, cl client.Client, ns, name string) (bool, error) {
 	secret := &corev1.Secret{}
 	err := cl.Get(ctx, client.ObjectKey{Namespace: ns, Name: name}, secret)
@@ -112,68 +77,39 @@ func hasTLSSecretData(ctx context.Context, cl client.Client, ns, name string) (b
 	return len(secret.Data[corev1.TLSCertKey]) > 0 && len(secret.Data[corev1.TLSPrivateKeyKey]) > 0, nil
 }
 
-func ensureManagedTLSSecret(ctx context.Context, cl client.Client, name, namespace string, labels map[string]string, source *corev1.Secret) error {
-	secret := managedTLSSecret(name, namespace, labels, source)
-	_, err := createOrUpdate(ctx, cl, namespace, secret, func(existing *corev1.Secret) {
-		existing.Labels = secret.Labels
-		existing.Type = secret.Type
-		existing.Data = secret.Data
-	})
-	if err != nil {
-		return fmt.Errorf("creating or updating managed TLS Secret %s/%s: %w", namespace, name, err)
+func ingressHTTPSHosts(defaultHost string, customTLS *ingressCustomTLS) []string {
+	hosts := []string{defaultHost}
+	if customTLS != nil && customTLS.host != defaultHost {
+		hosts = append([]string{customTLS.host}, hosts...)
+	}
+	return hosts
+}
+
+func copyCustomTLSSecretData(data map[string][]byte, customTLS *ingressCustomTLS) {
+	if customTLS == nil {
+		return
+	}
+	mak.Set(&data, customTLS.host+".crt", append([]byte(nil), customTLS.secret.Data[corev1.TLSCertKey]...))
+	mak.Set(&data, customTLS.host+".key", append([]byte(nil), customTLS.secret.Data[corev1.TLSPrivateKeyKey]...))
+}
+
+func ensureCustomTLSStateSecrets(ctx context.Context, cl client.Client, namespace string, pg *tsapi.ProxyGroup, customTLS *ingressCustomTLS) error {
+	if customTLS == nil {
+		return nil
+	}
+	secrets := &corev1.SecretList{}
+	if err := cl.List(ctx, secrets, client.InNamespace(namespace), client.MatchingLabels(pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeState))); err != nil {
+		return fmt.Errorf("listing ProxyGroup state Secrets for %q: %w", pg.Name, err)
+	}
+	for i := range secrets.Items {
+		secret := &secrets.Items[i]
+		orig := secret.DeepCopy()
+		copyCustomTLSSecretData(secret.Data, customTLS)
+		if err := cl.Patch(ctx, secret, client.MergeFrom(orig)); err != nil {
+			return fmt.Errorf("updating ProxyGroup state Secret %s/%s: %w", namespace, secret.Name, err)
+		}
 	}
 	return nil
-}
-
-func customTLSSecretsForProxyGroup(ctx context.Context, cl client.Client, pgName string) ([]ingressCustomTLS, error) {
-	ingList := &networkingv1.IngressList{}
-	if err := cl.List(ctx, ingList); err != nil {
-		return nil, fmt.Errorf("listing Ingresses for ProxyGroup %q: %w", pgName, err)
-	}
-
-	custom := make([]ingressCustomTLS, 0)
-	for i := range ingList.Items {
-		ing := &ingList.Items[i]
-		if ing.Annotations[AnnotationProxyGroup] != pgName {
-			continue
-		}
-		tlsCfg, err := customTLSForIngress(ctx, cl, ing)
-		if err != nil {
-			return nil, fmt.Errorf("Ingress %s/%s: %w", ing.Namespace, ing.Name, err)
-		}
-		if tlsCfg == nil {
-			continue
-		}
-		custom = append(custom, *tlsCfg)
-	}
-	return custom, nil
-}
-
-func proxyGroupUsesCustomTLS(ctx context.Context, cl client.Client, pgName string) (bool, error) {
-	ingList := &networkingv1.IngressList{}
-	if err := cl.List(ctx, ingList); err != nil {
-		return false, fmt.Errorf("listing Ingresses for ProxyGroup %q: %w", pgName, err)
-	}
-
-	var total, custom int
-	for i := range ingList.Items {
-		ing := &ingList.Items[i]
-		if ing.Annotations[AnnotationProxyGroup] != pgName {
-			continue
-		}
-		total++
-		if len(ing.Spec.TLS) > 0 && ing.Spec.TLS[0].SecretName != "" {
-			custom++
-		}
-	}
-
-	if custom == 0 {
-		return false, nil
-	}
-	if custom != total {
-		return false, fmt.Errorf("all Ingresses on ProxyGroup %q must set spec.tls[0].secretName when any of them use a custom TLS Secret", pgName)
-	}
-	return true, nil
 }
 
 func indexTLSSecretName(o client.Object) []string {

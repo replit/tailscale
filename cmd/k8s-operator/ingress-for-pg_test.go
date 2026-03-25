@@ -33,6 +33,7 @@ import (
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/ptr"
+	"tailscale.com/util/mak"
 )
 
 func TestIngressPGReconciler(t *testing.T) {
@@ -1345,19 +1346,24 @@ func TestIngressPGReconciler_CustomTLSSecret(t *testing.T) {
 	if _, ok := svc.Web[ipn.HostPort("zerg.zergrush.dev:443")]; !ok {
 		t.Fatalf("expected custom HTTPS host in service config, got keys %v", maps.Keys(svc.Web))
 	}
+	if _, ok := svc.Web[ipn.HostPort("zerg.ts.net:443")]; !ok {
+		t.Fatalf("expected MagicDNS HTTPS host in service config, got keys %v", maps.Keys(svc.Web))
+	}
 
-	expectedTLSSecret := certSecret("test-pg", "operator-ns", "zerg.zergrush.dev", ing, &ingressCustomTLS{
-		host:       "zerg.zergrush.dev",
-		secretName: "wildcard-cert",
-		secret: &corev1.Secret{Data: map[string][]byte{
-			corev1.TLSCertKey:       []byte("fake-cert"),
-			corev1.TLSPrivateKeyKey: []byte("fake-key"),
-		}},
-	})
+	expectedTLSSecret := certSecret("test-pg", "operator-ns", "zerg.ts.net", ing)
 	expectEqual(t, fc, expectedTLSSecret)
-	expectEqual(t, fc, certSecretRole("test-pg", "operator-ns", "zerg.zergrush.dev"))
+	expectEqual(t, fc, certSecretRole("test-pg", "operator-ns", "zerg.ts.net"))
 	pg := &tsapi.ProxyGroup{ObjectMeta: metav1.ObjectMeta{Name: "test-pg"}}
-	expectEqual(t, fc, certSecretRoleBinding(pg, "operator-ns", "zerg.zergrush.dev"))
+	expectEqual(t, fc, certSecretRoleBinding(pg, "operator-ns", "zerg.ts.net"))
+
+	stateSecret := &corev1.Secret{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "test-pg-0", Namespace: "operator-ns"}, stateSecret); err != nil {
+		t.Fatalf("getting state Secret: %v", err)
+	}
+	expectedStateSecret := stateSecret.DeepCopy()
+	mak.Set(&expectedStateSecret.Data, "zerg.zergrush.dev.crt", []byte("fake-cert"))
+	mak.Set(&expectedStateSecret.Data, "zerg.zergrush.dev.key", []byte("fake-key"))
+	expectEqual(t, fc, expectedStateSecret)
 }
 
 func setupIngressTest(t *testing.T) (*HAIngressReconciler, client.Client, *fakeTSClient) {

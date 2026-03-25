@@ -396,16 +396,11 @@ func (r *ProxyGroupReconciler) maybeProvision(ctx context.Context, tailscaleClie
 		}
 	}
 
-	customTLS, err := proxyGroupUsesCustomTLS(ctx, r.Client, pg.Name)
-	if err != nil {
-		return r.notReadyErrf(pg, logger, "error determining custom TLS mode: %w", err)
-	}
-
 	defaultImage := r.tsProxyImage
 	if pg.Spec.Type == tsapi.ProxyGroupTypeKubernetesAPIServer {
 		defaultImage = r.k8sProxyImage
 	}
-	ss, err := pgStatefulSet(pg, r.tsNamespace, defaultImage, r.tsFirewallMode, tailscaledPort, proxyClass, customTLS)
+	ss, err := pgStatefulSet(pg, r.tsNamespace, defaultImage, r.tsFirewallMode, tailscaledPort, proxyClass)
 	if err != nil {
 		return r.notReadyErrf(pg, logger, "error generating StatefulSet spec: %w", err)
 	}
