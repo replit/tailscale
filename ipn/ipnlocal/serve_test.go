@@ -1009,6 +1009,139 @@ func TestServeHTTPProxyGrantHeader(t *testing.T) {
 	}
 }
 
+func TestServeHTTPProxyGrantHeaderForVIPService(t *testing.T) {
+	b := newTestBackend(t)
+
+	svcIPMapJSON, err := json.Marshal(tailcfg.ServiceIPMappings{
+		"svc:foo": {netip.MustParseAddr("100.101.101.101")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nm := b.NetMap()
+	self := nm.SelfNode.AsStruct()
+	self.CapMap = tailcfg.NodeCapMap{
+		tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
+	}
+	nm.SelfNode = self.View()
+
+	matches, err := filter.MatchesFromFilterRules([]tailcfg.FilterRule{
+		{
+			SrcIPs: []string{"100.150.151.152"},
+			CapGrant: []tailcfg.CapGrant{{
+				Dsts: []netip.Prefix{
+					netip.MustParsePrefix("100.101.101.101/32"),
+				},
+				CapMap: tailcfg.PeerCapMap{
+					"example.com/cap/interesting": []tailcfg.RawMessage{
+						`{"role": "🐿"}`,
+					},
+				},
+			}},
+		},
+		{
+			SrcIPs: []string{"100.150.151.153"},
+			CapGrant: []tailcfg.CapGrant{{
+				Dsts: []netip.Prefix{
+					netip.MustParsePrefix("100.101.101.101/32"),
+				},
+				CapMap: tailcfg.PeerCapMap{
+					"example.com/cap/boring": []tailcfg.RawMessage{
+						`{"role": "Viewer"}`,
+					},
+					"example.com/cap/irrelevant": []tailcfg.RawMessage{
+						`{"role": "Editor"}`,
+					},
+				},
+			}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	nm.PacketFilter = matches
+	b.SetControlClientStatus(nil, controlclient.Status{NetMap: nm})
+
+	testServ := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for key, val := range r.Header {
+			w.Header().Add(key, strings.Join(val, ","))
+		}
+	}))
+	defer testServ.Close()
+
+	conf := &ipn.ServeConfig{
+		Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+			"svc:foo": {
+				TCP: map[uint16]*ipn.TCPPortHandler{
+					443: {HTTPS: true},
+				},
+				Web: map[ipn.HostPort]*ipn.WebServerConfig{
+					"foo.example.com:443": {Handlers: map[string]*ipn.HTTPHandler{
+						"/": {
+							Proxy:         testServ.URL,
+							AcceptAppCaps: []tailcfg.PeerCapability{"example.com/cap/interesting", "example.com/cap/boring"},
+						},
+					}},
+				},
+			},
+		},
+	}
+	if err := b.SetServeConfig(conf, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		srcIP   string
+		wantCap string
+	}{
+		{
+			name:    "request-from-user-within-tailnet",
+			srcIP:   "100.150.151.152",
+			wantCap: `{"example.com/cap/interesting":[{"role":"🐿"}]}`,
+		},
+		{
+			name:    "request-from-tagged-node-within-tailnet",
+			srcIP:   "100.150.151.153",
+			wantCap: `{"example.com/cap/boring":[{"role":"Viewer"}]}`,
+		},
+		{
+			name:    "request-from-outside-tailnet",
+			srcIP:   "100.160.161.162",
+			wantCap: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := &http.Request{
+				Host: "foo.example.com",
+				URL:  &url.URL{Path: "/"},
+				TLS:  &tls.ConnectionState{ServerName: "foo.example.com"},
+			}
+			req = req.WithContext(serveHTTPContextKey.WithValue(req.Context(), &serveHTTPContext{
+				ForVIPService: "svc:foo",
+				DestPort:      443,
+				SrcAddr:       netip.MustParseAddrPort(tt.srcIP + ":1234"),
+			}))
+
+			w := httptest.NewRecorder()
+			b.serveWebHandler(w, req)
+
+			dec := new(mime.WordDecoder)
+			maybeEncoded := w.Result().Header.Get("Tailscale-App-Capabilities")
+			got, err := dec.DecodeHeader(maybeEncoded)
+			if err != nil {
+				t.Fatalf("invalid %q header; failed to decode: %v", maybeEncoded, err)
+			}
+			if got != tt.wantCap {
+				t.Errorf("invalid %q header; want=%q, got=%q", "Tailscale-App-Capabilities", tt.wantCap, got)
+			}
+		})
+	}
+}
+
 func Test_reverseProxyConfiguration(t *testing.T) {
 	b := newTestBackend(t)
 	type test struct {
