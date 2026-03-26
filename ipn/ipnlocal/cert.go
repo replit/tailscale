@@ -125,24 +125,28 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 	if !validLookingCertDomain(domain) {
 		return nil, errors.New("invalid domain")
 	}
-
-	certDomain, err := b.resolveCertDomain(domain)
+	now := b.clock.Now()
+	cs, err := b.getCertStore()
 	if err != nil {
 		return nil, err
 	}
+
+	certDomain, err := b.resolveCertDomain(domain)
+	if err != nil {
+		if pair, cacheErr := getCertPEMCached(cs, domain, now); cacheErr == nil {
+			return pair, nil
+		} else if cacheErr != nil && !errors.Is(cacheErr, ipn.ErrStateNotExist) {
+			return nil, cacheErr
+		}
+		return nil, err
+	}
 	logf := logger.WithPrefix(b.logf, fmt.Sprintf("cert(%q): ", domain))
-	now := b.clock.Now()
 	traceACME := func(v any) {
 		if !acmeDebug() {
 			return
 		}
 		j, _ := json.MarshalIndent(v, "", "\t")
 		log.Printf("acme %T: %s", v, j)
-	}
-
-	cs, err := b.getCertStore()
-	if err != nil {
-		return nil, err
 	}
 
 	if pair, err := getCertPEMCached(cs, certDomain, now); err == nil {

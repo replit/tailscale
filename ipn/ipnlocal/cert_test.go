@@ -581,3 +581,61 @@ func TestGetCertPEMWithValidity(t *testing.T) {
 		})
 	}
 }
+
+func TestGetCertPEMWithValidityUsesCachedCustomDomain(t *testing.T) {
+	const (
+		certDomain   = "node.ts.net"
+		customDomain = "example.com"
+	)
+	b := newTestLocalBackend(t)
+	b.varRoot = t.TempDir()
+	b.clock = tstest.NewClock(tstest.ClockOpts{Start: time.Date(2023, time.February, 20, 0, 0, 0, 0, time.UTC)})
+	testRoot, err := certTestFS.ReadFile("testdata/rootCA.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(testRoot) {
+		t.Fatal("Unable to add test CA to the cert pool")
+	}
+	testX509Roots = roots
+	defer func() { testX509Roots = nil }()
+
+	b.mu.Lock()
+	b.currentNode().SetNetMap(&netmap.NetworkMap{
+		SelfNode: (&tailcfg.Node{}).View(),
+		DNS: tailcfg.DNSConfig{
+			CertDomains: []string{certDomain},
+		},
+	})
+	b.mu.Unlock()
+
+	certDir, err := b.certDir()
+	if err != nil {
+		t.Fatalf("certDir error: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, customDomain+".crt"), must.Get(os.ReadFile("testdata/example.com.pem")), 0644); err != nil {
+		t.Fatalf("writing cached cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, customDomain+".key"), must.Get(os.ReadFile("testdata/example.com-key.pem")), 0644); err != nil {
+		t.Fatalf("writing cached key: %v", err)
+	}
+
+	called := false
+	getCertPEM = func(ctx context.Context, b *LocalBackend, cs certStore, logf logger.Logf, traceACME func(any), domain string, now time.Time, minValidity time.Duration) (*TLSCertKeyPair, error) {
+		called = true
+		return nil, nil
+	}
+	defer func() { getCertPEM = nil }()
+
+	pair, err := b.GetCertPEMWithValidity(context.Background(), customDomain, 0)
+	if err != nil {
+		t.Fatalf("GetCertPEMWithValidity(%q): %v", customDomain, err)
+	}
+	if pair == nil {
+		t.Fatalf("GetCertPEMWithValidity(%q) returned nil pair", customDomain)
+	}
+	if called {
+		t.Fatalf("GetCertPEMWithValidity(%q) unexpectedly attempted issuance", customDomain)
+	}
+}
