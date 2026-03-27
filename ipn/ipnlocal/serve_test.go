@@ -1012,26 +1012,13 @@ func TestServeHTTPProxyGrantHeader(t *testing.T) {
 func TestServeHTTPProxyGrantHeaderForVIPService(t *testing.T) {
 	b := newTestBackend(t)
 
-	svcIPMapJSON, err := json.Marshal(tailcfg.ServiceIPMappings{
-		"svc:foo": {netip.MustParseAddr("100.101.101.101")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	nm := b.NetMap()
-	self := nm.SelfNode.AsStruct()
-	self.CapMap = tailcfg.NodeCapMap{
-		tailcfg.NodeAttrServiceHost: []tailcfg.RawMessage{tailcfg.RawMessage(svcIPMapJSON)},
-	}
-	nm.SelfNode = self.View()
-
 	matches, err := filter.MatchesFromFilterRules([]tailcfg.FilterRule{
 		{
 			SrcIPs: []string{"100.150.151.152"},
 			CapGrant: []tailcfg.CapGrant{{
 				Dsts: []netip.Prefix{
-					netip.MustParsePrefix("100.101.101.101/32"),
+					netip.MustParsePrefix("100.150.151.151/32"),
 				},
 				CapMap: tailcfg.PeerCapMap{
 					"example.com/cap/interesting": []tailcfg.RawMessage{
@@ -1044,7 +1031,7 @@ func TestServeHTTPProxyGrantHeaderForVIPService(t *testing.T) {
 			SrcIPs: []string{"100.150.151.153"},
 			CapGrant: []tailcfg.CapGrant{{
 				Dsts: []netip.Prefix{
-					netip.MustParsePrefix("100.101.101.101/32"),
+					netip.MustParsePrefix("100.150.151.151/32"),
 				},
 				CapMap: tailcfg.PeerCapMap{
 					"example.com/cap/boring": []tailcfg.RawMessage{

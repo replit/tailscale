@@ -295,14 +295,6 @@ func (nb *nodeBackend) PeerCaps(src netip.Addr) tailcfg.PeerCapMap {
 	return nb.peerCapsLocked(src)
 }
 
-// peerCapsForService returns the capabilities that remote src IP has to the
-// specified VIP service hosted by this node.
-func (nb *nodeBackend) peerCapsForService(src netip.Addr, serviceName tailcfg.ServiceName) tailcfg.PeerCapMap {
-	nb.mu.Lock()
-	defer nb.mu.Unlock()
-	return nb.peerCapsForServiceLocked(src, serviceName)
-}
-
 func (nb *nodeBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
 	if nb.netMap == nil {
 		return nil
@@ -318,26 +310,6 @@ func (nb *nodeBackend) peerCapsLocked(src netip.Addr) tailcfg.PeerCapMap {
 			continue
 		}
 		dst := a.Addr()
-		if dst.BitLen() == src.BitLen() { // match on family
-			return filt.CapsWithValues(src, dst)
-		}
-	}
-	return nil
-}
-
-func (nb *nodeBackend) peerCapsForServiceLocked(src netip.Addr, serviceName tailcfg.ServiceName) tailcfg.PeerCapMap {
-	if nb.netMap == nil || serviceName == "" {
-		return nil
-	}
-	filt := nb.filterAtomic.Load()
-	if filt == nil {
-		return nil
-	}
-	serviceIPMap := nb.netMap.GetVIPServiceIPMap()
-	if len(serviceIPMap) == 0 {
-		return nil
-	}
-	for _, dst := range serviceIPMap[serviceName] {
 		if dst.BitLen() == src.BitLen() { // match on family
 			return filt.CapsWithValues(src, dst)
 		}

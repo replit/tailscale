@@ -1101,12 +1101,7 @@ func (b *LocalBackend) addAppCapabilitiesHeader(r *httputil.ProxyRequest) error 
 	if acceptCaps.IsNil() {
 		return nil
 	}
-	var peerCaps tailcfg.PeerCapMap
-	if c.ForVIPService != "" {
-		peerCaps = b.currentNode().peerCapsForService(c.SrcAddr.Addr(), c.ForVIPService)
-	} else {
-		peerCaps = b.PeerCaps(c.SrcAddr.Addr())
-	}
+	peerCaps := b.PeerCaps(c.SrcAddr.Addr())
 	if peerCaps == nil {
 		return nil
 	}
