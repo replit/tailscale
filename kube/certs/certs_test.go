@@ -100,6 +100,20 @@ func TestEnsureCertLoops(t *testing.T) {
 			initialGoroutines: 1, // only one loop for the 443 endpoint
 		},
 		{
+			name: "ignore_custom_tls_domains",
+			initialConfig: &ipn.ServeConfig{
+				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{
+					"svc:my-app": {
+						Web: map[ipn.HostPort]*ipn.WebServerConfig{
+							"my-app.tailnetxyz.ts.net:443": {},
+							"my-app.example.com:443":       {},
+						},
+					},
+				},
+			},
+			initialGoroutines: 1,
+		},
+		{
 			name: "remove_domain",
 			initialConfig: &ipn.ServeConfig{
 				Services: map[tailcfg.ServiceName]*ipn.ServiceConfig{

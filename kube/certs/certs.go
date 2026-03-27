@@ -71,6 +71,17 @@ func (cm *CertManager) EnsureCertLoops(ctx context.Context, sc *ipn.ServeConfig)
 			}
 		}
 	}
+	if len(currentDomains) > 0 {
+		certDomains, err := cm.certDomains(ctx)
+		if err != nil {
+			return fmt.Errorf("error getting cert domains: %w", err)
+		}
+		for domain := range currentDomains {
+			if !certDomains[domain] {
+				delete(currentDomains, domain)
+			}
+		}
+	}
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	for domain := range currentDomains {
@@ -92,6 +103,29 @@ func (cm *CertManager) EnsureCertLoops(ctx context.Context, sc *ipn.ServeConfig)
 		}
 	}
 	return nil
+}
+
+func (cm *CertManager) certDomains(ctx context.Context) (map[string]bool, error) {
+	w, err := cm.lc.WatchIPNBus(ctx, ipn.NotifyInitialNetMap)
+	if err != nil {
+		return nil, fmt.Errorf("error watching IPN bus: %w", err)
+	}
+	defer w.Close()
+
+	for {
+		n, err := w.Next()
+		if err != nil {
+			return nil, err
+		}
+		if n.NetMap == nil {
+			continue
+		}
+		certDomains := make(map[string]bool, len(n.NetMap.DNS.CertDomains))
+		for _, domain := range n.NetMap.DNS.CertDomains {
+			certDomains[domain] = true
+		}
+		return certDomains, nil
+	}
 }
 
 // runCertLoop:
