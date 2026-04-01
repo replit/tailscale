@@ -476,6 +476,7 @@ authLoop:
 		currentIPs             deephash.Sum // tailscale IPs assigned to device
 		currentDeviceID        deephash.Sum // device ID
 		currentDeviceEndpoints deephash.Sum // device FQDN and IPs
+		currentCertDomains     []string
 
 		currentEgressIPs deephash.Sum
 
@@ -653,12 +654,15 @@ runLoop:
 					backendAddrs = newBackendAddrs
 				}
 				if cfg.ServeConfigPath != "" {
+					newCertDomains := append([]string(nil), n.NetMap.DNS.CertDomains...)
+					certDomainsHaveChanged := !slices.Equal(currentCertDomains, newCertDomains)
+					currentCertDomains = newCertDomains
 					cd := certDomainFromNetmap(n.NetMap)
 					if cd == "" {
 						cd = kubetypes.ValueNoHTTPS
 					}
 					prev := certDomain.Swap(new(cd))
-					if prev == nil || *prev != cd {
+					if prev == nil || *prev != cd || certDomainsHaveChanged {
 						select {
 						case certDomainChanged <- true:
 						default:

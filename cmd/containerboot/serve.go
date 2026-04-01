@@ -91,18 +91,18 @@ func watchServeConfigChanges(ctx context.Context, cdChanged <-chan bool, certDom
 				log.Printf("serve proxy: no serve config at %q, skipping", cfg.ServeConfigPath)
 				continue
 			}
-			if prevServeConfig != nil && reflect.DeepEqual(sc, prevServeConfig) {
-				continue
-			}
-			if err := updateServeConfig(ctx, sc, certDomain, klc.New(lc)); err != nil {
-				log.Fatalf("serve proxy: error updating serve config: %v", err)
-			}
-			if kc != nil && kc.canPatch {
-				if err := kc.storeHTTPSEndpoint(ctx, certDomain); err != nil {
-					log.Fatalf("serve proxy: error storing HTTPS endpoint: %v", err)
+			configChanged := prevServeConfig == nil || !reflect.DeepEqual(sc, prevServeConfig)
+			if configChanged {
+				if err := updateServeConfig(ctx, sc, certDomain, klc.New(lc)); err != nil {
+					log.Fatalf("serve proxy: error updating serve config: %v", err)
 				}
+				if kc != nil && kc.canPatch {
+					if err := kc.storeHTTPSEndpoint(ctx, certDomain); err != nil {
+						log.Fatalf("serve proxy: error storing HTTPS endpoint: %v", err)
+					}
+				}
+				prevServeConfig = sc
 			}
-			prevServeConfig = sc
 			if cfg.CertShareMode != "rw" {
 				continue
 			}
