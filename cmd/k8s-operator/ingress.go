@@ -442,9 +442,17 @@ func isHTTPRedirectEnabled(ing *networkingv1.Ingress) bool {
 }
 
 // hostnameForIngress returns the hostname for an Ingress resource.
-// If the Ingress has TLS configured with a host, it returns the first component of that host.
-// Otherwise, it returns a hostname derived from the Ingress name and namespace.
+// This hostname is used as the Tailscale Service name (svc:<hostname>)
+// and the first label of the MagicDNS name.
+//
+// Priority:
+// 1. tailscale.com/service-name annotation (explicit override)
+// 2. First DNS label of the first TLS host
+// 3. Fallback: <namespace>-<name>-ingress
 func hostnameForIngress(ing *networkingv1.Ingress) string {
+	if name, ok := ing.Annotations["tailscale.com/service-name"]; ok && name != "" {
+		return name
+	}
 	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
 		h := ing.Spec.TLS[0].Hosts[0]
 		hostname, _, _ := strings.Cut(h, ".")
