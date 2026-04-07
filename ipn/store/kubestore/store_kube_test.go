@@ -571,6 +571,45 @@ func TestReadTLSCertAndKey(t *testing.T) {
 			secretGetErr:  fmt.Errorf("api error"),
 			wantErr:       fmt.Errorf("getting TLS Secret %q: api error", sanitizeKey(testDomain)),
 		},
+		{
+			// When both the state Secret (custom cert from Ingress TLS)
+			// and domain-specific Secret (ACME cert) have data for the
+			// same custom (non-ts.net) domain, the state Secret should
+			// take precedence.
+			name:          "cert_share_rw_mode_custom_cert_takes_precedence",
+			certShareMode: "rw",
+			domain:        "app.example.com",
+			secretDataByName: map[string]map[string][]byte{
+				"ts-state": {
+					"app.example.com.crt": []byte("custom-cert"),
+					"app.example.com.key": []byte("custom-key"),
+				},
+				"app.example.com": {
+					"tls.crt": []byte("acme-cert"),
+					"tls.key": []byte("acme-key"),
+				},
+			},
+			wantCert: []byte("custom-cert"),
+			wantKey:  []byte("custom-key"),
+		},
+		{
+			// Same test for ro mode.
+			name:          "cert_share_ro_mode_custom_cert_takes_precedence",
+			certShareMode: "ro",
+			domain:        "app.example.com",
+			secretDataByName: map[string]map[string][]byte{
+				"ts-state": {
+					"app.example.com.crt": []byte("custom-cert"),
+					"app.example.com.key": []byte("custom-key"),
+				},
+				"app.example.com": {
+					"tls.crt": []byte("acme-cert"),
+					"tls.key": []byte("acme-key"),
+				},
+			},
+			wantCert: []byte("custom-cert"),
+			wantKey:  []byte("custom-key"),
+		},
 	}
 
 	for _, tt := range tests {

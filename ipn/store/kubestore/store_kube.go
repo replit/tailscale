@@ -7,6 +7,7 @@ package kubestore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -189,9 +190,18 @@ func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) 
 	return nil
 }
 
-// ReadTLSCertAndKey reads a TLS cert and key from memory or from a
-// domain-specific Secret. It first checks the in-memory store, if not found in
-// memory and running cert store in read-only mode, looks up a Secret.
+// ReadTLSCertAndKey reads a TLS cert and key from memory or from Kubernetes
+// Secrets. It first checks the in-memory store, then reads from Kubernetes
+// Secrets with ordering that depends on the domain type:
+//
+// For custom domains (non-ts.net): the pod's state Secret is checked first,
+// since custom TLS certs from Ingress spec.tls entries are written there by
+// the operator. This ensures user-provided custom certs take precedence over
+// any ACME-provisioned certs in domain-specific Secrets.
+//
+// For ts.net domains: the domain-specific Secret is checked first (standard
+// ACME cert sharing path), falling back to the state Secret.
+//
 // Note that write replicas of HA Ingress always retrieve TLS certs from Secrets.
 func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 	if err := dnsname.ValidHostname(domain); err != nil {
@@ -212,6 +222,29 @@ func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	// For custom (non-ts.net) domains, check the pod's state Secret first.
+	// Custom TLS certs (from Ingress spec.tls[].secretName) are written
+	// here by the operator, keyed as "domain.crt" / "domain.key". Checking
+	// this before the domain-specific Secret ensures custom certs take
+	// precedence over ACME-provisioned certs for the same domain.
+	if !strings.HasSuffix(domain, ".ts.net") {
+		cert, key, stateErr := s.readTLSCertAndKeyFromStateSecret(ctx, certKey, keyKey)
+		if stateErr == nil {
+			if s.certShareMode == "ro" {
+				s.memory.WriteState(ipn.StateKey(certKey), cert)
+				s.memory.WriteState(ipn.StateKey(keyKey), key)
+			}
+			return cert, key, nil
+		}
+		if !errors.Is(stateErr, ipn.ErrStateNotExist) {
+			// Real error reading state Secret (e.g. API failure).
+			return nil, nil, stateErr
+		}
+		// State Secret didn't have the cert; fall through to
+		// domain-specific Secret.
+	}
+
 	secret, err := s.client.GetSecret(ctx, domain)
 	if err != nil {
 		if kubeclient.IsNotFoundErr(err) {
