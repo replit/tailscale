@@ -670,9 +670,11 @@ func (r *HAIngressReconciler) validateIngress(ctx context.Context, ing *networki
 		}
 	}
 
-	// Validate TLS configuration
-	if len(ing.Spec.TLS) > 0 && (len(ing.Spec.TLS) > 1 || len(ing.Spec.TLS[0].Hosts) > 1) {
-		errs = append(errs, fmt.Errorf("Ingress contains invalid TLS block %v: only a single TLS entry with a single host is allowed", ing.Spec.TLS))
+	// Validate TLS configuration — allow multiple hosts in a single TLS entry
+	// (additional hosts beyond the first are served using the same custom cert).
+	// Only one TLS entry is allowed.
+	if len(ing.Spec.TLS) > 1 {
+		errs = append(errs, fmt.Errorf("Ingress contains invalid TLS block %v: only a single TLS entry is allowed (multiple hosts within one entry are OK)", ing.Spec.TLS))
 	}
 
 	// Validate that the hostname will be a valid DNS label
