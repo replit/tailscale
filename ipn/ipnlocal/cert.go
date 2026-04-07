@@ -133,8 +133,24 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 
 	certDomain, err := b.resolveCertDomain(domain)
 	if err != nil {
+		// A domain is considered custom (user-provided cert) if:
+		// 1. It's not in CertDomains (errNotACMEManaged), AND
+		// 2. It doesn't look like a ts.net domain (to avoid serving
+		//    expired ACME certs for renamed/removed ts.net names).
+		isCustomDomain := errors.Is(err, errNotACMEManaged) && !strings.HasSuffix(domain, ".ts.net")
 		if pair, cacheErr := getCertPEMCached(cs, domain, now); cacheErr == nil {
 			return pair, nil
+		} else if isCustomDomain && errors.Is(cacheErr, errCertExpired) {
+			// The cert exists in the store but failed x509 chain or
+			// domain validation. For custom domain certs provided by
+			// the user (e.g., via Kubernetes Ingress spec.tls), serve
+			// the cert as-is — the user is responsible for ensuring
+			// the cert is valid for their domain. Only verify that
+			// the cert/key form a valid TLS keypair.
+			if pair, rawErr := cs.ReadRaw(domain); rawErr == nil {
+				return pair, nil
+			}
+			return nil, cacheErr
 		} else if cacheErr != nil && !errors.Is(cacheErr, ipn.ErrStateNotExist) {
 			return nil, cacheErr
 		}
@@ -292,6 +308,13 @@ type certStore interface {
 	// for now. If they're expired, it returns errCertExpired.
 	// If they don't exist, it returns ipn.ErrStateNotExist.
 	Read(domain string, now time.Time) (*TLSCertKeyPair, error)
+	// ReadRaw returns the cert and key for domain without performing x509
+	// chain or domain validation. It only checks that the cert and key are
+	// parseable as a valid TLS keypair. This is used for user-provided
+	// custom TLS certs (non-ts.net domains) where we should serve whatever
+	// the user provided regardless of CA trust or domain matching.
+	// If cert/key don't exist, it returns ipn.ErrStateNotExist.
+	ReadRaw(domain string) (*TLSCertKeyPair, error)
 	// ACMEKey returns the value previously stored via WriteACMEKey.
 	// It is a PEM encoded ECDSA key.
 	ACMEKey() ([]byte, error)
@@ -302,6 +325,11 @@ type certStore interface {
 }
 
 var errCertExpired = errors.New("cert expired")
+
+// errNotACMEManaged is returned by resolveCertDomain when the requested
+// domain is not one of the node's ACME-managed CertDomains. This indicates
+// a custom domain (e.g., user-provided TLS cert via Kubernetes Ingress).
+var errNotACMEManaged = errors.New("domain is not ACME-managed")
 
 var testX509Roots *x509.CertPool // set non-nil by tests
 
@@ -386,6 +414,30 @@ func (f certFileStore) Read(domain string, now time.Time) (*TLSCertKeyPair, erro
 	return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
 }
 
+func (f certFileStore) ReadRaw(domain string) (*TLSCertKeyPair, error) {
+	if !validLookingCertDomain(domain) {
+		return nil, fmt.Errorf("invalid domain %q", domain)
+	}
+	certPEM, err := os.ReadFile(certFile(f.dir, domain))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ipn.ErrStateNotExist
+		}
+		return nil, err
+	}
+	keyPEM, err := os.ReadFile(keyFile(f.dir, domain))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, ipn.ErrStateNotExist
+		}
+		return nil, err
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return nil, fmt.Errorf("invalid TLS keypair for %q: %w", domain, err)
+	}
+	return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
+}
+
 func (f certFileStore) WriteCert(domain string, cert []byte) error {
 	return atomicfile.WriteFile(certFile(f.dir, domain), cert, 0644)
 }
@@ -443,6 +495,34 @@ func (s certStateStore) Read(domain string, now time.Time) (*TLSCertKeyPair, err
 	}
 	if !validCertPEM(domain, keyPEM, certPEM, s.testRoots, now) {
 		return nil, errCertExpired
+	}
+	return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
+}
+
+func (s certStateStore) ReadRaw(domain string) (*TLSCertKeyPair, error) {
+	if !validLookingCertDomain(domain) {
+		return nil, fmt.Errorf("invalid domain %q", domain)
+	}
+	if kr, ok := s.StateStore.(TLSCertKeyReader); ok {
+		cert, key, err := kr.ReadTLSCertAndKey(domain)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := tls.X509KeyPair(cert, key); err != nil {
+			return nil, fmt.Errorf("invalid TLS keypair for %q: %w", domain, err)
+		}
+		return &TLSCertKeyPair{CertPEM: cert, KeyPEM: key, Cached: true}, nil
+	}
+	certPEM, err := s.ReadState(ipn.StateKey(domain + ".crt"))
+	if err != nil {
+		return nil, err
+	}
+	keyPEM, err := s.ReadState(ipn.StateKey(domain + ".key"))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := tls.X509KeyPair(certPEM, keyPEM); err != nil {
+		return nil, fmt.Errorf("invalid TLS keypair for %q: %w", domain, err)
 	}
 	return &TLSCertKeyPair{CertPEM: certPEM, KeyPEM: keyPEM, Cached: true}, nil
 }
@@ -919,7 +999,7 @@ func (b *LocalBackend) resolveCertDomain(domain string) (string, error) {
 	}
 	certDomains := nm.DNS.CertDomains
 	if len(certDomains) == 0 {
-		return "", errors.New("your Tailscale account does not support getting TLS certs")
+		return "", fmt.Errorf("your Tailscale account does not support getting TLS certs: %w", errNotACMEManaged)
 	}
 
 	// Wildcard request like "*.node.ts.net".
@@ -938,7 +1018,7 @@ func (b *LocalBackend) resolveCertDomain(domain string) (string, error) {
 		return domain, nil
 	}
 
-	return "", fmt.Errorf("invalid domain %q; must be one of %q", domain, certDomains)
+	return "", fmt.Errorf("invalid domain %q; must be one of %q: %w", domain, certDomains, errNotACMEManaged)
 }
 
 // handleC2NTLSCertStatus returns info about the last TLS certificate issued for the
