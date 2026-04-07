@@ -255,8 +255,8 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		return false, fmt.Errorf("error determining DNS name for service: %w", err)
 	}
 	httpsHost := dnsName
-	if customTLS != nil {
-		httpsHost = customTLS.host
+	if customTLS != nil && len(customTLS.hosts) > 0 {
+		httpsHost = customTLS.hosts[0]
 	}
 	serviceHosts := ingressHTTPSHosts(dnsName, customTLS)
 
@@ -273,7 +273,8 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		logger.Infof("no Ingress serve config ConfigMap found, unable to update serve config. Ensure that ProxyGroup is healthy.")
 		return svcsChanged, nil
 	}
-	handlers, err := handlersForIngress(ctx, ing, r.Client, r.recorder, httpsHost, logger)
+	tlsHosts := ingressTLSHosts(ing)
+	handlers, err := handlersForIngress(ctx, ing, r.Client, r.recorder, tlsHosts, logger)
 	if err != nil {
 		return false, fmt.Errorf("failed to get handlers for Ingress: %w", err)
 	}

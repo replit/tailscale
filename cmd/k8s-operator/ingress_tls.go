@@ -25,14 +25,14 @@ import (
 const indexIngressTLSSecret = ".spec.tls.secretName"
 
 type ingressCustomTLS struct {
-	host       string
+	hosts      []string
 	secretName string
 	secret     *corev1.Secret
 }
 
 func customTLSForIngress(ctx context.Context, cl client.Client, ing *networkingv1.Ingress) (*ingressCustomTLS, error) {
-	host := ingressTLSHost(ing)
-	if host == "" || len(ing.Spec.TLS) == 0 || ing.Spec.TLS[0].SecretName == "" {
+	hosts := ingressTLSHosts(ing)
+	if len(hosts) == 0 || len(ing.Spec.TLS) == 0 || ing.Spec.TLS[0].SecretName == "" {
 		return nil, nil
 	}
 
@@ -45,15 +45,24 @@ func customTLSForIngress(ctx context.Context, cl client.Client, ing *networkingv
 	}
 
 	return &ingressCustomTLS{
-		host:       host,
+		hosts:      hosts,
 		secretName: ing.Spec.TLS[0].SecretName,
 		secret:     secret,
 	}, nil
 }
 
-func ingressTLSHost(ing *networkingv1.Ingress) string {
+// ingressTLSHosts returns all hosts from the first TLS entry of the Ingress.
+func ingressTLSHosts(ing *networkingv1.Ingress) []string {
 	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
-		return ing.Spec.TLS[0].Hosts[0]
+		return ing.Spec.TLS[0].Hosts
+	}
+	return nil
+}
+
+// ingressTLSHost returns the first host from the first TLS entry of the Ingress.
+func ingressTLSHost(ing *networkingv1.Ingress) string {
+	if hosts := ingressTLSHosts(ing); len(hosts) > 0 {
+		return hosts[0]
 	}
 	return ""
 }
@@ -78,9 +87,21 @@ func hasTLSSecretData(ctx context.Context, cl client.Client, ns, name string) (b
 }
 
 func ingressHTTPSHosts(defaultHost string, customTLS *ingressCustomTLS) []string {
-	hosts := []string{defaultHost}
-	if customTLS != nil && customTLS.host != defaultHost {
-		hosts = append([]string{customTLS.host}, hosts...)
+	if customTLS == nil {
+		return []string{defaultHost}
+	}
+	// Custom TLS hosts come first, followed by the default MagicDNS host
+	// (if it's not already one of the custom hosts).
+	seen := make(map[string]bool, len(customTLS.hosts)+1)
+	var hosts []string
+	for _, h := range customTLS.hosts {
+		if !seen[h] {
+			hosts = append(hosts, h)
+			seen[h] = true
+		}
+	}
+	if !seen[defaultHost] {
+		hosts = append(hosts, defaultHost)
 	}
 	return hosts
 }
@@ -89,8 +110,10 @@ func copyCustomTLSSecretData(data map[string][]byte, customTLS *ingressCustomTLS
 	if customTLS == nil {
 		return
 	}
-	mak.Set(&data, customTLS.host+".crt", append([]byte(nil), customTLS.secret.Data[corev1.TLSCertKey]...))
-	mak.Set(&data, customTLS.host+".key", append([]byte(nil), customTLS.secret.Data[corev1.TLSPrivateKeyKey]...))
+	for _, host := range customTLS.hosts {
+		mak.Set(&data, host+".crt", append([]byte(nil), customTLS.secret.Data[corev1.TLSCertKey]...))
+		mak.Set(&data, host+".key", append([]byte(nil), customTLS.secret.Data[corev1.TLSPrivateKeyKey]...))
+	}
 }
 
 func ensureCustomTLSStateSecrets(ctx context.Context, cl client.Client, namespace string, pg *tsapi.ProxyGroup, customTLS *ingressCustomTLS) error {

@@ -192,11 +192,8 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		}
 	}
 
-	var tlsHost string // hostname or FQDN or empty
-	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
-		tlsHost = ing.Spec.TLS[0].Hosts[0]
-	}
-	handlers, err := handlersForIngress(ctx, ing, a.Client, a.recorder, tlsHost, logger)
+	tlsHosts := ingressTLSHosts(ing)
+	handlers, err := handlersForIngress(ctx, ing, a.Client, a.recorder, tlsHosts, logger)
 	if err != nil {
 		return fmt.Errorf("failed to get handlers for ingress: %w", err)
 	}
@@ -246,7 +243,10 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		LoginServer:         a.ssr.loginServer,
 	}
 	if customTLS != nil {
-		sts.CustomTLSCerts = map[string]*corev1.Secret{customTLS.host: customTLS.secret}
+		sts.CustomTLSCerts = make(map[string]*corev1.Secret, len(customTLS.hosts))
+		for _, h := range customTLS.hosts {
+			sts.CustomTLSCerts[h] = customTLS.secret
+		}
 	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
@@ -273,8 +273,8 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		}
 
 		hostname := dev.ingressDNSName
-		if customTLS != nil {
-			hostname = customTLS.host
+		if customTLS != nil && len(customTLS.hosts) > 0 {
+			hostname = customTLS.hosts[0]
 		}
 		logger.Debugf("setting Ingress hostname to %q", hostname)
 		ports := []networkingv1.IngressPortStatus{}
@@ -362,7 +362,7 @@ func parseAcceptAppCaps(ing *networkingv1.Ingress, rec record.EventRecorder) []t
 	return caps
 }
 
-func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl client.Client, rec record.EventRecorder, tlsHost string, logger *zap.SugaredLogger) (handlers map[string]*ipn.HTTPHandler, err error) {
+func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl client.Client, rec record.EventRecorder, tlsHosts []string, logger *zap.SugaredLogger) (handlers map[string]*ipn.HTTPHandler, err error) {
 	acceptAppCaps := parseAcceptAppCaps(ing, rec)
 	addIngressBackend := func(b *networkingv1.IngressBackend, path string) {
 		if path == "" {
@@ -412,10 +412,14 @@ func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl clien
 		})
 	}
 	addIngressBackend(ing.Spec.DefaultBackend, "/")
+	tlsHostSet := make(map[string]bool, len(tlsHosts))
+	for _, h := range tlsHosts {
+		tlsHostSet[h] = true
+	}
 	for _, rule := range ing.Spec.Rules {
-		// Host is optional, but if it's present it must match the TLS host
+		// Host is optional, but if it's present it must match one of the TLS hosts
 		// otherwise we ignore the rule.
-		if rule.Host != "" && rule.Host != tlsHost {
+		if rule.Host != "" && !tlsHostSet[rule.Host] {
 			rec.Eventf(ing, corev1.EventTypeWarning, "InvalidIngressBackend", "rule with host %q ignored, unsupported", rule.Host)
 			continue
 		}
