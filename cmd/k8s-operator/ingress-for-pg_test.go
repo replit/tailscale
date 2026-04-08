@@ -32,6 +32,8 @@ import (
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
 	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/ptr"
+	"tailscale.com/util/mak"
 )
 
 func TestIngressPGReconciler(t *testing.T) {
@@ -1185,6 +1187,183 @@ func createPGResources(t *testing.T, fc client.Client, pgName string) {
 	if err := fc.Status().Update(context.Background(), pg); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestIngressPGReconciler_AcceptAppCaps(t *testing.T) {
+	ingPGR, fc, ft := setupIngressTest(t)
+
+	// Create backend Service that the Ingress will route to
+	backendSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test",
+			Namespace: "default",
+		},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.0.0.1",
+			Ports: []corev1.ServicePort{
+				{
+					Port: 8080,
+				},
+			},
+		},
+	}
+	mustCreate(t, fc, backendSvc)
+
+	// Create test Ingress with accept-app-caps annotation
+	ing := &networkingv1.Ingress{
+		TypeMeta: metav1.TypeMeta{Kind: "Ingress", APIVersion: "networking.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-ingress",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				"tailscale.com/proxy-group":     "test-pg",
+				"tailscale.com/accept-app-caps": "example.com/cap/monitoring,example.com/cap/admin",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("tailscale"),
+			DefaultBackend: &networkingv1.IngressBackend{
+				Service: &networkingv1.IngressServiceBackend{
+					Name: "test",
+					Port: networkingv1.ServiceBackendPort{
+						Number: 8080,
+					},
+				},
+			},
+			TLS: []networkingv1.IngressTLS{
+				{Hosts: []string{"my-svc"}},
+			},
+		},
+	}
+	if err := fc.Create(context.Background(), ing); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reconcile
+	expectReconciled(t, ingPGR, "default", "test-ingress")
+	populateTLSSecret(t, fc, "test-pg", "my-svc.ts.net")
+	expectReconciled(t, ingPGR, "default", "test-ingress")
+
+	// Verify Tailscale Service
+	verifyTailscaleService(t, ft, "svc:my-svc", []string{"tcp:443"})
+
+	// Verify the serve config has AcceptAppCaps on handlers
+	cm := &corev1.ConfigMap{}
+	if err := fc.Get(context.Background(), types.NamespacedName{
+		Name:      "test-pg-ingress-config",
+		Namespace: "operator-ns",
+	}, cm); err != nil {
+		t.Fatalf("getting ConfigMap: %v", err)
+	}
+
+	cfg := &ipn.ServeConfig{}
+	if err := json.Unmarshal(cm.BinaryData["serve-config.json"], cfg); err != nil {
+		t.Fatalf("unmarshaling serve config: %v", err)
+	}
+
+	svc := cfg.Services[tailcfg.ServiceName("svc:my-svc")]
+	if svc == nil {
+		t.Fatal("service svc:my-svc not found in serve config")
+	}
+
+	ep := ipn.HostPort("my-svc.ts.net:443")
+	webCfg := svc.Web[ep]
+	if webCfg == nil {
+		t.Fatalf("web config for %q not found", ep)
+	}
+
+	handler := webCfg.Handlers["/"]
+	if handler == nil {
+		t.Fatal("handler for path / not found")
+	}
+
+	wantCaps := []tailcfg.PeerCapability{"example.com/cap/monitoring", "example.com/cap/admin"}
+	if !reflect.DeepEqual(handler.AcceptAppCaps, wantCaps) {
+		t.Errorf("AcceptAppCaps = %v, want %v", handler.AcceptAppCaps, wantCaps)
+	}
+}
+
+func TestIngressPGReconciler_CustomTLSSecret(t *testing.T) {
+	ingPGR, fc, ft := setupIngressTest(t)
+
+	backendSvc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+		Spec: corev1.ServiceSpec{
+			ClusterIP: "10.0.0.1",
+			Ports:     []corev1.ServicePort{{Port: 8080}},
+		},
+	}
+	mustCreate(t, fc, backendSvc)
+	mustCreate(t, fc, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "wildcard-cert", Namespace: "default"},
+		Type:       corev1.SecretTypeTLS,
+		Data: map[string][]byte{
+			corev1.TLSCertKey:       []byte("fake-cert"),
+			corev1.TLSPrivateKeyKey: []byte("fake-key"),
+		},
+	})
+
+	ing := &networkingv1.Ingress{
+		TypeMeta: metav1.TypeMeta{Kind: "Ingress", APIVersion: "networking.k8s.io/v1"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-ingress",
+			Namespace: "default",
+			UID:       types.UID("1234-UID"),
+			Annotations: map[string]string{
+				"tailscale.com/proxy-group": "test-pg",
+			},
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: ptr.To("tailscale"),
+			DefaultBackend: &networkingv1.IngressBackend{
+				Service: &networkingv1.IngressServiceBackend{
+					Name: "test",
+					Port: networkingv1.ServiceBackendPort{Number: 8080},
+				},
+			},
+			TLS: []networkingv1.IngressTLS{{Hosts: []string{"zerg.zergrush.dev"}, SecretName: "wildcard-cert"}},
+		},
+	}
+	mustCreate(t, fc, ing)
+
+	expectReconciled(t, ingPGR, "default", "test-ingress")
+	verifyTailscaleService(t, ft, "svc:zerg", []string{"tcp:443"})
+	verifyTailscaledConfig(t, fc, "test-pg", []string{"svc:zerg"})
+
+	cm := &corev1.ConfigMap{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "test-pg-ingress-config", Namespace: "operator-ns"}, cm); err != nil {
+		t.Fatalf("getting ConfigMap: %v", err)
+	}
+	cfg := &ipn.ServeConfig{}
+	if err := json.Unmarshal(cm.BinaryData[serveConfigKey], cfg); err != nil {
+		t.Fatalf("unmarshaling serve config: %v", err)
+	}
+	svc := cfg.Services[tailcfg.ServiceName("svc:zerg")]
+	if svc == nil {
+		t.Fatal("service svc:zerg not found in serve config")
+	}
+	if _, ok := svc.Web[ipn.HostPort("zerg.zergrush.dev:443")]; !ok {
+		t.Fatalf("expected custom HTTPS host in service config, got keys %v", maps.Keys(svc.Web))
+	}
+	if _, ok := svc.Web[ipn.HostPort("zerg.ts.net:443")]; !ok {
+		t.Fatalf("expected MagicDNS HTTPS host in service config, got keys %v", maps.Keys(svc.Web))
+	}
+
+	expectedTLSSecret := certSecret("test-pg", "operator-ns", "zerg.ts.net", ing)
+	expectEqual(t, fc, expectedTLSSecret)
+	expectEqual(t, fc, certSecretRole("test-pg", "operator-ns", "zerg.ts.net"))
+	pg := &tsapi.ProxyGroup{ObjectMeta: metav1.ObjectMeta{Name: "test-pg"}}
+	expectEqual(t, fc, certSecretRoleBinding(pg, "operator-ns", "zerg.ts.net"))
+
+	stateSecret := &corev1.Secret{}
+	if err := fc.Get(context.Background(), types.NamespacedName{Name: "test-pg-0", Namespace: "operator-ns"}, stateSecret); err != nil {
+		t.Fatalf("getting state Secret: %v", err)
+	}
+	expectedStateSecret := stateSecret.DeepCopy()
+	mak.Set(&expectedStateSecret.Data, "zerg.zergrush.dev.crt", []byte("fake-cert"))
+	mak.Set(&expectedStateSecret.Data, "zerg.zergrush.dev.key", []byte("fake-key"))
+	expectEqual(t, fc, expectedStateSecret)
 }
 
 func setupIngressTest(t *testing.T) (*HAIngressReconciler, client.Client, *fakeTSClient) {

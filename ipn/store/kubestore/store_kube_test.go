@@ -431,15 +431,17 @@ func TestReadTLSCertAndKey(t *testing.T) {
 	)
 
 	tests := []struct {
-		name          string
-		memoryStore   map[ipn.StateKey][]byte // pre-existing memory store state
-		certShareMode string
-		domain        string
-		secretData    map[string][]byte // data to return from mock GetSecret
-		secretGetErr  error             // error to return from mock GetSecret
-		wantCert      []byte
-		wantKey       []byte
-		wantErr       error
+		name               string
+		memoryStore        map[ipn.StateKey][]byte // pre-existing memory store state
+		certShareMode      string
+		domain             string
+		secretData         map[string][]byte // data to return from mock GetSecret
+		secretGetErr       error             // error to return from mock GetSecret
+		secretDataByName   map[string]map[string][]byte
+		secretGetErrByName map[string]error
+		wantCert           []byte
+		wantKey            []byte
+		wantErr            error
 		// what should end up in memory store after the store is created
 		wantMemoryStore map[ipn.StateKey][]byte
 	}{
@@ -489,6 +491,38 @@ func TestReadTLSCertAndKey(t *testing.T) {
 			wantKey:  []byte(testKey),
 		},
 		{
+			name:          "cert_share_ro_mode_fallback_to_state_secret",
+			certShareMode: "ro",
+			domain:        testDomain,
+			secretDataByName: map[string]map[string][]byte{
+				"ts-state": {
+					testDomain + ".crt": []byte(testCert),
+					testDomain + ".key": []byte(testKey),
+				},
+			},
+			secretGetErrByName: map[string]error{
+				testDomain: &kubeapi.Status{Code: 404},
+			},
+			wantCert: []byte(testCert),
+			wantKey:  []byte(testKey),
+		},
+		{
+			name:          "cert_share_rw_mode_fallback_to_state_secret",
+			certShareMode: "rw",
+			domain:        testDomain,
+			secretDataByName: map[string]map[string][]byte{
+				"ts-state": {
+					testDomain + ".crt": []byte(testCert),
+					testDomain + ".key": []byte(testKey),
+				},
+			},
+			secretGetErrByName: map[string]error{
+				testDomain: &kubeapi.Status{Code: 404},
+			},
+			wantCert: []byte(testCert),
+			wantKey:  []byte(testKey),
+		},
+		{
 			name:          "cert_share_ro_mode_found_in_memory",
 			certShareMode: "ro",
 			memoryStore: map[ipn.StateKey][]byte{
@@ -514,8 +548,11 @@ func TestReadTLSCertAndKey(t *testing.T) {
 			name:          "cert_share_ro_mode_forbidden",
 			certShareMode: "ro",
 			domain:        testDomain,
-			secretGetErr:  &kubeapi.Status{Code: 403},
-			wantErr:       ipn.ErrStateNotExist,
+			secretGetErrByName: map[string]error{
+				testDomain: &kubeapi.Status{Code: 403},
+				"ts-state": &kubeapi.Status{Code: 404},
+			},
+			wantErr: ipn.ErrStateNotExist,
 		},
 		{
 			name:          "cert_share_ro_mode_empty_cert_in_secret",
@@ -534,6 +571,45 @@ func TestReadTLSCertAndKey(t *testing.T) {
 			secretGetErr:  fmt.Errorf("api error"),
 			wantErr:       fmt.Errorf("getting TLS Secret %q: api error", sanitizeKey(testDomain)),
 		},
+		{
+			// When both the state Secret (custom cert from Ingress TLS)
+			// and domain-specific Secret (ACME cert) have data for the
+			// same custom (non-ts.net) domain, the state Secret should
+			// take precedence.
+			name:          "cert_share_rw_mode_custom_cert_takes_precedence",
+			certShareMode: "rw",
+			domain:        "app.example.com",
+			secretDataByName: map[string]map[string][]byte{
+				"ts-state": {
+					"app.example.com.crt": []byte("custom-cert"),
+					"app.example.com.key": []byte("custom-key"),
+				},
+				"app.example.com": {
+					"tls.crt": []byte("acme-cert"),
+					"tls.key": []byte("acme-key"),
+				},
+			},
+			wantCert: []byte("custom-cert"),
+			wantKey:  []byte("custom-key"),
+		},
+		{
+			// Same test for ro mode.
+			name:          "cert_share_ro_mode_custom_cert_takes_precedence",
+			certShareMode: "ro",
+			domain:        "app.example.com",
+			secretDataByName: map[string]map[string][]byte{
+				"ts-state": {
+					"app.example.com.crt": []byte("custom-cert"),
+					"app.example.com.key": []byte("custom-key"),
+				},
+				"app.example.com": {
+					"tls.crt": []byte("acme-cert"),
+					"tls.key": []byte("acme-key"),
+				},
+			},
+			wantCert: []byte("custom-cert"),
+			wantKey:  []byte("custom-key"),
+		},
 	}
 
 	for _, tt := range tests {
@@ -541,6 +617,16 @@ func TestReadTLSCertAndKey(t *testing.T) {
 
 			client := &kubeclient.FakeClient{
 				GetSecretImpl: func(ctx context.Context, name string) (*kubeapi.Secret, error) {
+					if tt.secretGetErrByName != nil {
+						if err, ok := tt.secretGetErrByName[name]; ok {
+							return nil, err
+						}
+					}
+					if tt.secretDataByName != nil {
+						if data, ok := tt.secretDataByName[name]; ok {
+							return &kubeapi.Secret{Data: data}, nil
+						}
+					}
 					if tt.secretGetErr != nil {
 						return nil, tt.secretGetErr
 					}

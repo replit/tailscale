@@ -1048,6 +1048,7 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 	r.Out.Header.Del("Tailscale-User-Login")
 	r.Out.Header.Del("Tailscale-User-Name")
 	r.Out.Header.Del("Tailscale-User-Profile-Pic")
+	r.Out.Header.Del("Tailscale-Caller-Tags")
 	r.Out.Header.Del("Tailscale-Funnel-Request")
 	r.Out.Header.Del("Tailscale-Headers-Info")
 
@@ -1064,8 +1065,10 @@ func (b *LocalBackend) addTailscaleIdentityHeaders(r *httputil.ProxyRequest) {
 		return // traffic from outside of Tailnet (funneled or local machine)
 	}
 	if node.IsTagged() {
-		// 2023-06-14: Not setting identity headers for tagged nodes.
-		// Only currently set for nodes with user identities.
+		tags := strings.Join(node.Tags().AsSlice(), ",")
+		r.Out.Header.Set("Tailscale-User-Login", encTailscaleHeaderValue(tags))
+		r.Out.Header.Set("Tailscale-Caller-Tags", encTailscaleHeaderValue(tags))
+		r.Out.Header.Set("Tailscale-Headers-Info", "https://tailscale.com/s/serve-headers")
 		return
 	}
 	r.Out.Header.Set("Tailscale-User-Login", encTailscaleHeaderValue(user.LoginName))
@@ -1297,9 +1300,14 @@ func (b *LocalBackend) webServerConfig(hostname string, forVIPService tailcfg.Se
 		return c, false
 	}
 	if forVIPService != "" {
+		key := ipn.HostPort(net.JoinHostPort(hostname, fmt.Sprintf("%d", port)))
+		if cfg, ok := b.serveConfig.FindServiceWeb(forVIPService, key); ok {
+			return cfg, true
+		}
+
 		magicDNSSuffix := b.currentNode().NetMap().MagicDNSSuffix()
 		fqdn := strings.Join([]string{forVIPService.WithoutPrefix(), magicDNSSuffix}, ".")
-		key := ipn.HostPort(net.JoinHostPort(fqdn, fmt.Sprintf("%d", port)))
+		key = ipn.HostPort(net.JoinHostPort(fqdn, fmt.Sprintf("%d", port)))
 		return b.serveConfig.FindServiceWeb(forVIPService, key)
 	}
 	key := ipn.HostPort(net.JoinHostPort(hostname, fmt.Sprintf("%d", port)))

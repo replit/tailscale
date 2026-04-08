@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ import (
 
 	"tailscale.com/ipn"
 	"tailscale.com/kube/kubetypes"
+	"tailscale.com/tailcfg"
 	"tailscale.com/types/opt"
 	"tailscale.com/util/clientmetric"
 	"tailscale.com/util/mak"
@@ -162,65 +164,61 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	gaugeIngressResources.Set(int64(a.managedIngresses.Len()))
 	a.mu.Unlock()
 
-	if !IsHTTPSEnabledOnTailnet(a.ssr.tsnetServer) {
+	customTLS, err := customTLSForIngress(ctx, a.Client, ing)
+	if err != nil {
+		return fmt.Errorf("failed to configure custom TLS for ingress: %w", err)
+	}
+
+	if customTLS == nil && !IsHTTPSEnabledOnTailnet(a.ssr.tsnetServer) {
 		a.recorder.Event(ing, corev1.EventTypeWarning, "HTTPSNotEnabled", "HTTPS is not enabled on the tailnet; ingress may not work")
 	}
 
-	// magic443 is a fake hostname that we can use to tell containerboot to swap
-	// out with the real hostname once it's known.
-	const magic443 = "${TS_CERT_DOMAIN}:443"
+	httpsHosts := ingressHTTPSHosts("${TS_CERT_DOMAIN}", customTLS)
 	sc := &ipn.ServeConfig{
 		TCP: map[uint16]*ipn.TCPPortHandler{
 			443: {
 				HTTPS: true,
 			},
 		},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{
-			magic443: {
-				Handlers: map[string]*ipn.HTTPHandler{},
-			},
-		},
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{},
+	}
+	for _, host := range httpsHosts {
+		sc.Web[ipn.HostPort(host+":443")] = &ipn.WebServerConfig{Handlers: map[string]*ipn.HTTPHandler{}}
 	}
 	if opt.Bool(ing.Annotations[AnnotationFunnel]).EqualBool(true) {
-		sc.AllowFunnel = map[ipn.HostPort]bool{
-			magic443: true,
+		sc.AllowFunnel = map[ipn.HostPort]bool{}
+		for _, host := range httpsHosts {
+			sc.AllowFunnel[ipn.HostPort(host+":443")] = true
 		}
 	}
 
-	web := sc.Web[magic443]
-
-	var tlsHost string // hostname or FQDN or empty
-	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
-		tlsHost = ing.Spec.TLS[0].Hosts[0]
-	}
-	handlers, err := handlersForIngress(ctx, ing, a.Client, a.recorder, tlsHost, logger)
+	tlsHosts := ingressTLSHosts(ing)
+	handlers, err := handlersForIngress(ctx, ing, a.Client, a.recorder, tlsHosts, logger)
 	if err != nil {
 		return fmt.Errorf("failed to get handlers for ingress: %w", err)
 	}
-	web.Handlers = handlers
-	if len(web.Handlers) == 0 {
+	if len(handlers) == 0 {
 		logger.Warn("Ingress contains no valid backends")
 		a.recorder.Eventf(ing, corev1.EventTypeWarning, "NoValidBackends", "no valid backends")
 		return nil
 	}
+	for _, host := range httpsHosts {
+		sc.Web[ipn.HostPort(host+":443")].Handlers = handlers
+	}
 
 	if isHTTPRedirectEnabled(ing) {
 		logger.Infof("HTTP redirect enabled, setting up port 80 redirect handlers")
-		const magic80 = "${TS_CERT_DOMAIN}:80"
 		sc.TCP[80] = &ipn.TCPPortHandler{HTTP: true}
-		sc.Web[magic80] = &ipn.WebServerConfig{
-			Handlers: map[string]*ipn.HTTPHandler{},
-		}
-		if sc.AllowFunnel != nil && sc.AllowFunnel[magic443] {
-			sc.AllowFunnel[magic80] = true
-		}
-		web80 := sc.Web[magic80]
-		for mountPoint := range handlers {
-			// We send a 301 - Moved Permanently redirect from HTTP to HTTPS
-			redirectURL := "301:https://${HOST}${REQUEST_URI}"
-			logger.Debugf("Creating redirect handler: %s -> %s", mountPoint, redirectURL)
-			web80.Handlers[mountPoint] = &ipn.HTTPHandler{
-				Redirect: redirectURL,
+		for _, host := range httpsHosts {
+			host80 := ipn.HostPort(host + ":80")
+			sc.Web[host80] = &ipn.WebServerConfig{Handlers: map[string]*ipn.HTTPHandler{}}
+			if sc.AllowFunnel != nil {
+				sc.AllowFunnel[host80] = true
+			}
+			for mountPoint := range handlers {
+				redirectURL := "301:https://${HOST}${REQUEST_URI}"
+				logger.Debugf("Creating redirect handler: %s -> %s", mountPoint, redirectURL)
+				sc.Web[host80].Handlers[mountPoint] = &ipn.HTTPHandler{Redirect: redirectURL}
 			}
 		}
 	}
@@ -244,6 +242,12 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 		proxyType:           proxyTypeIngressResource,
 		LoginServer:         a.ssr.loginServer,
 	}
+	if customTLS != nil {
+		sts.CustomTLSCerts = make(map[string]*corev1.Secret, len(customTLS.hosts))
+		for _, h := range customTLS.hosts {
+			sts.CustomTLSCerts[h] = customTLS.secret
+		}
+	}
 
 	if val := ing.GetAnnotations()[AnnotationExperimentalForwardClusterTrafficViaL7IngresProxy]; val == "true" {
 		sts.ForwardClusterTrafficViaL7IngressProxy = true
@@ -257,19 +261,28 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 	if err != nil {
 		return fmt.Errorf("failed to retrieve Ingress HTTPS endpoint status: %w", err)
 	}
+	hasHTTPS := customTLS == nil
+	if customTLS != nil {
+		hasHTTPS = true
+	}
 
 	ing.Status.LoadBalancer.Ingress = nil
 	for _, dev := range devices {
-		if dev.ingressDNSName == "" {
+		if dev.ingressDNSName == "" && customTLS == nil {
 			continue
 		}
 
-		logger.Debugf("setting Ingress hostname to %q", dev.ingressDNSName)
-		ports := []networkingv1.IngressPortStatus{
-			{
+		hostname := dev.ingressDNSName
+		if customTLS != nil && len(customTLS.hosts) > 0 {
+			hostname = customTLS.hosts[0]
+		}
+		logger.Debugf("setting Ingress hostname to %q", hostname)
+		ports := []networkingv1.IngressPortStatus{}
+		if hasHTTPS {
+			ports = append(ports, networkingv1.IngressPortStatus{
 				Protocol: "TCP",
 				Port:     443,
-			},
+			})
 		}
 		if isHTTPRedirectEnabled(ing) {
 			ports = append(ports, networkingv1.IngressPortStatus{
@@ -278,7 +291,7 @@ func (a *IngressReconciler) maybeProvision(ctx context.Context, logger *zap.Suga
 			})
 		}
 		ing.Status.LoadBalancer.Ingress = append(ing.Status.LoadBalancer.Ingress, networkingv1.IngressLoadBalancerIngress{
-			Hostname: dev.ingressDNSName,
+			Hostname: hostname,
 			Ports:    ports,
 		})
 	}
@@ -320,7 +333,37 @@ func validateIngressClass(ctx context.Context, cl client.Client, ingressClassNam
 	return nil
 }
 
-func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl client.Client, rec record.EventRecorder, tlsHost string, logger *zap.SugaredLogger) (handlers map[string]*ipn.HTTPHandler, err error) {
+// validAppCap matches application capability names of the form {domain}/{name}.
+// Both parts must use the (simplified) FQDN label character set.
+// The "name" can contain forward slashes.
+var validAppCap = regexp.MustCompile(`^([\pL\pN-]+\.)+[\pL\pN-]+\/[\pL\pN-/]+$`)
+
+// parseAcceptAppCaps reads the AnnotationAcceptAppCaps annotation from the
+// Ingress, splits it by comma, validates each capability name, and returns the
+// valid ones. Invalid capabilities are skipped with a warning event.
+func parseAcceptAppCaps(ing *networkingv1.Ingress, rec record.EventRecorder) []tailcfg.PeerCapability {
+	raw, ok := ing.Annotations[AnnotationAcceptAppCaps]
+	if !ok || raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	var caps []tailcfg.PeerCapability
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if !validAppCap.MatchString(p) {
+			rec.Eventf(ing, corev1.EventTypeWarning, "InvalidAppCapability", "ignoring invalid app capability %q", p)
+			continue
+		}
+		caps = append(caps, tailcfg.PeerCapability(p))
+	}
+	return caps
+}
+
+func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl client.Client, rec record.EventRecorder, tlsHosts []string, logger *zap.SugaredLogger) (handlers map[string]*ipn.HTTPHandler, err error) {
+	acceptAppCaps := parseAcceptAppCaps(ing, rec)
 	addIngressBackend := func(b *networkingv1.IngressBackend, path string) {
 		if path == "" {
 			path = "/"
@@ -364,14 +407,19 @@ func handlersForIngress(ctx context.Context, ing *networkingv1.Ingress, cl clien
 			proto = "https+insecure://"
 		}
 		mak.Set(&handlers, path, &ipn.HTTPHandler{
-			Proxy: proto + svc.Spec.ClusterIP + ":" + fmt.Sprint(port) + path,
+			Proxy:         proto + svc.Spec.ClusterIP + ":" + fmt.Sprint(port) + path,
+			AcceptAppCaps: acceptAppCaps,
 		})
 	}
 	addIngressBackend(ing.Spec.DefaultBackend, "/")
+	tlsHostSet := make(map[string]bool, len(tlsHosts))
+	for _, h := range tlsHosts {
+		tlsHostSet[h] = true
+	}
 	for _, rule := range ing.Spec.Rules {
-		// Host is optional, but if it's present it must match the TLS host
+		// Host is optional, but if it's present it must match one of the TLS hosts
 		// otherwise we ignore the rule.
-		if rule.Host != "" && rule.Host != tlsHost {
+		if rule.Host != "" && !tlsHostSet[rule.Host] {
 			rec.Eventf(ing, corev1.EventTypeWarning, "InvalidIngressBackend", "rule with host %q ignored, unsupported", rule.Host)
 			continue
 		}
@@ -398,9 +446,17 @@ func isHTTPRedirectEnabled(ing *networkingv1.Ingress) bool {
 }
 
 // hostnameForIngress returns the hostname for an Ingress resource.
-// If the Ingress has TLS configured with a host, it returns the first component of that host.
-// Otherwise, it returns a hostname derived from the Ingress name and namespace.
+// This hostname is used as the Tailscale Service name (svc:<hostname>)
+// and the first label of the MagicDNS name.
+//
+// Priority:
+// 1. tailscale.com/service-name annotation (explicit override)
+// 2. First DNS label of the first TLS host
+// 3. Fallback: <namespace>-<name>-ingress
 func hostnameForIngress(ing *networkingv1.Ingress) string {
+	if name, ok := ing.Annotations["tailscale.com/service-name"]; ok && name != "" {
+		return name
+	}
 	if ing.Spec.TLS != nil && len(ing.Spec.TLS) > 0 && len(ing.Spec.TLS[0].Hosts) > 0 {
 		h := ing.Spec.TLS[0].Hosts[0]
 		hostname, _, _ := strings.Cut(h, ".")

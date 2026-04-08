@@ -7,6 +7,7 @@ package kubestore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -189,9 +190,18 @@ func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) 
 	return nil
 }
 
-// ReadTLSCertAndKey reads a TLS cert and key from memory or from a
-// domain-specific Secret. It first checks the in-memory store, if not found in
-// memory and running cert store in read-only mode, looks up a Secret.
+// ReadTLSCertAndKey reads a TLS cert and key from memory or from Kubernetes
+// Secrets. It first checks the in-memory store, then reads from Kubernetes
+// Secrets with ordering that depends on the domain type:
+//
+// For custom domains (non-ts.net): the pod's state Secret is checked first,
+// since custom TLS certs from Ingress spec.tls entries are written there by
+// the operator. This ensures user-provided custom certs take precedence over
+// any ACME-provisioned certs in domain-specific Secrets.
+//
+// For ts.net domains: the domain-specific Secret is checked first (standard
+// ACME cert sharing path), falling back to the state Secret.
+//
 // Note that write replicas of HA Ingress always retrieve TLS certs from Secrets.
 func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 	if err := dnsname.ValidHostname(domain); err != nil {
@@ -212,36 +222,48 @@ func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+
+	// For custom (non-ts.net) domains, check the pod's state Secret first.
+	// Custom TLS certs (from Ingress spec.tls[].secretName) are written
+	// here by the operator, keyed as "domain.crt" / "domain.key". Checking
+	// this before the domain-specific Secret ensures custom certs take
+	// precedence over ACME-provisioned certs for the same domain.
+	if !strings.HasSuffix(domain, ".ts.net") {
+		cert, key, stateErr := s.readTLSCertAndKeyFromStateSecret(ctx, certKey, keyKey)
+		if stateErr == nil {
+			if s.certShareMode == "ro" {
+				s.memory.WriteState(ipn.StateKey(certKey), cert)
+				s.memory.WriteState(ipn.StateKey(keyKey), key)
+			}
+			return cert, key, nil
+		}
+		if !errors.Is(stateErr, ipn.ErrStateNotExist) {
+			// Real error reading state Secret (e.g. API failure).
+			return nil, nil, stateErr
+		}
+		// State Secret didn't have the cert; fall through to
+		// domain-specific Secret.
+	}
+
 	secret, err := s.client.GetSecret(ctx, domain)
 	if err != nil {
 		if kubeclient.IsNotFoundErr(err) {
-			// TODO(irbekrm): we should return a more specific error
-			// that wraps ipn.ErrStateNotExist here.
-			return nil, nil, ipn.ErrStateNotExist
+			return s.readTLSCertAndKeyFromStateSecret(ctx, certKey, keyKey)
 		}
 		st, ok := err.(*kubeapi.Status)
 		if ok && st.Code == http.StatusForbidden && (s.certShareMode == "ro" || s.certShareMode == "rw") {
-			// In cert share mode, we read from a dedicated Secret per domain.
-			// To get here, we already had a cache miss from our in-memory
-			// store. For write replicas, that means it wasn't available on
-			// start and it wasn't written since. For read replicas, that means
-			// it wasn't available on start and it hasn't been reloaded in the
-			// background. So getting a "forbidden" error is an expected
-			// "not found" case where we've been asked for a cert we don't
-			// expect to issue, and so the forbidden error reflects that the
-			// operator didn't assign permission for a Secret for that domain.
-			//
-			// This code path gets triggered by the admin UI's machine page,
-			// which queries for the node's own TLS cert existing via the
-			// "tls-cert-status" c2n API.
-			return nil, nil, ipn.ErrStateNotExist
+			// In cert share mode, we normally read from a dedicated Secret per
+			// domain. However, externally managed custom TLS certs for HA
+			// ingress proxies may exist only in the pod's state Secret. Fall
+			// back to the state Secret before treating this as a cache miss.
+			return s.readTLSCertAndKeyFromStateSecret(ctx, certKey, keyKey)
 		}
 		return nil, nil, fmt.Errorf("getting TLS Secret %q: %w", domain, err)
 	}
 	cert = secret.Data[keyTLSCert]
 	key = secret.Data[keyTLSKey]
 	if len(cert) == 0 || len(key) == 0 {
-		return nil, nil, ipn.ErrStateNotExist
+		return s.readTLSCertAndKeyFromStateSecret(ctx, certKey, keyKey)
 	}
 	// TODO(irbekrm): a read between these two separate writes would
 	// get a mismatched cert and key.  Allow writing both cert and
@@ -256,6 +278,22 @@ func (s *Store) ReadTLSCertAndKey(domain string) (cert, key []byte, err error) {
 	if s.certShareMode == "ro" {
 		s.memory.WriteState(ipn.StateKey(certKey), cert)
 		s.memory.WriteState(ipn.StateKey(keyKey), key)
+	}
+	return cert, key, nil
+}
+
+func (s *Store) readTLSCertAndKeyFromStateSecret(ctx context.Context, certKey, keyKey string) ([]byte, []byte, error) {
+	stateSecret, err := s.client.GetSecret(ctx, s.secretName)
+	if err != nil {
+		if kubeclient.IsNotFoundErr(err) {
+			return nil, nil, ipn.ErrStateNotExist
+		}
+		return nil, nil, fmt.Errorf("getting TLS state Secret %q: %w", s.secretName, err)
+	}
+	cert := stateSecret.Data[sanitizeKey(certKey)]
+	key := stateSecret.Data[sanitizeKey(keyKey)]
+	if len(cert) == 0 || len(key) == 0 {
+		return nil, nil, ipn.ErrStateNotExist
 	}
 	return cert, key, nil
 }

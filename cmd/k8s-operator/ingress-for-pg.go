@@ -192,8 +192,12 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		r.recorder.Event(ing, corev1.EventTypeWarning, "InvalidIngressConfiguration", err.Error())
 		return false, nil
 	}
+	customTLS, err := customTLSForIngress(ctx, r.Client, ing)
+	if err != nil {
+		return false, fmt.Errorf("failed to configure custom TLS for Ingress: %w", err)
+	}
 
-	if !IsHTTPSEnabledOnTailnet(r.tsnetServer) {
+	if customTLS == nil && !IsHTTPSEnabledOnTailnet(r.tsnetServer) {
 		r.recorder.Event(ing, corev1.EventTypeWarning, "HTTPSNotEnabled", "HTTPS is not enabled on the tailnet; ingress may not work")
 	}
 
@@ -250,8 +254,13 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 	if err != nil {
 		return false, fmt.Errorf("error determining DNS name for service: %w", err)
 	}
+	httpsHost := dnsName
+	if customTLS != nil && len(customTLS.hosts) > 0 {
+		httpsHost = customTLS.hosts[0]
+	}
+	serviceHosts := ingressHTTPSHosts(dnsName, customTLS)
 
-	if err = r.ensureCertResources(ctx, pg, dnsName, ing); err != nil {
+	if err = r.ensureCertResources(ctx, pg, dnsName, ing, customTLS); err != nil {
 		return false, fmt.Errorf("error ensuring cert resources: %w", err)
 	}
 
@@ -264,8 +273,8 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		logger.Infof("no Ingress serve config ConfigMap found, unable to update serve config. Ensure that ProxyGroup is healthy.")
 		return svcsChanged, nil
 	}
-	ep := ipn.HostPort(fmt.Sprintf("%s:443", dnsName))
-	handlers, err := handlersForIngress(ctx, ing, r.Client, r.recorder, dnsName, logger)
+	tlsHosts := ingressTLSHosts(ing)
+	handlers, err := handlersForIngress(ctx, ing, r.Client, r.recorder, tlsHosts, logger)
 	if err != nil {
 		return false, fmt.Errorf("failed to get handlers for Ingress: %w", err)
 	}
@@ -275,40 +284,34 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 				HTTPS: true,
 			},
 		},
-		Web: map[ipn.HostPort]*ipn.WebServerConfig{
-			ep: {
-				Handlers: handlers,
-			},
-		},
+		Web: map[ipn.HostPort]*ipn.WebServerConfig{},
+	}
+	for _, host := range serviceHosts {
+		ingCfg.Web[ipn.HostPort(fmt.Sprintf("%s:443", host))] = &ipn.WebServerConfig{Handlers: handlers}
 	}
 
 	// Add HTTP endpoint if configured.
 	if isHTTPEndpointEnabled(ing) {
 		logger.Infof("exposing Ingress over HTTP")
-		epHTTP := ipn.HostPort(fmt.Sprintf("%s:80", dnsName))
 		ingCfg.TCP[80] = &ipn.TCPPortHandler{
 			HTTP: true,
 		}
-		ingCfg.Web[epHTTP] = &ipn.WebServerConfig{
-			Handlers: handlers,
+		for _, host := range serviceHosts {
+			ingCfg.Web[ipn.HostPort(fmt.Sprintf("%s:80", host))] = &ipn.WebServerConfig{Handlers: handlers}
 		}
 		if isHTTPRedirectEnabled(ing) {
 			logger.Warnf("Both HTTP endpoint and HTTP redirect flags are enabled: ignoring HTTP redirect.")
 		}
 	} else if isHTTPRedirectEnabled(ing) {
 		logger.Infof("HTTP redirect enabled, setting up port 80 redirect handlers")
-		epHTTP := ipn.HostPort(fmt.Sprintf("%s:80", dnsName))
 		ingCfg.TCP[80] = &ipn.TCPPortHandler{HTTP: true}
-		ingCfg.Web[epHTTP] = &ipn.WebServerConfig{
-			Handlers: map[string]*ipn.HTTPHandler{},
-		}
-		web80 := ingCfg.Web[epHTTP]
-		for mountPoint := range handlers {
-			// We send a 301 - Moved Permanently redirect from HTTP to HTTPS
-			redirectURL := "301:https://${HOST}${REQUEST_URI}"
-			logger.Debugf("Creating redirect handler: %s -> %s", mountPoint, redirectURL)
-			web80.Handlers[mountPoint] = &ipn.HTTPHandler{
-				Redirect: redirectURL,
+		for _, host := range serviceHosts {
+			epHTTP := ipn.HostPort(fmt.Sprintf("%s:80", host))
+			ingCfg.Web[epHTTP] = &ipn.WebServerConfig{Handlers: map[string]*ipn.HTTPHandler{}}
+			for mountPoint := range handlers {
+				redirectURL := "301:https://${HOST}${REQUEST_URI}"
+				logger.Debugf("Creating redirect handler: %s -> %s", mountPoint, redirectURL)
+				ingCfg.Web[epHTTP].Handlers[mountPoint] = &ipn.HTTPHandler{Redirect: redirectURL}
 			}
 		}
 	}
@@ -370,7 +373,7 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 	if isHTTPEndpointEnabled(ing) || isHTTPRedirectEnabled(ing) {
 		mode = serviceAdvertisementHTTPAndHTTPS
 	}
-	if err = r.maybeUpdateAdvertiseServicesConfig(ctx, serviceName, mode, pg); err != nil {
+	if err = r.maybeUpdateAdvertiseServicesConfig(ctx, serviceName, mode, pg, customTLS != nil); err != nil {
 		return false, fmt.Errorf("failed to update tailscaled config: %w", err)
 	}
 
@@ -391,8 +394,7 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		if err != nil {
 			return false, fmt.Errorf("error checking TLS credentials provisioned for Ingress: %w", err)
 		}
-		// If TLS certs have not been issued (yet), do not set port 443.
-		if hasCerts {
+		if customTLS != nil || hasCerts {
 			ports = append(ports, networkingv1.IngressPortStatus{
 				Protocol: "TCP",
 				Port:     443,
@@ -407,7 +409,7 @@ func (r *HAIngressReconciler) maybeProvision(ctx context.Context, hostname strin
 		// Set Ingress status hostname only if either port 443 or 80 is advertised.
 		var hostname string
 		if len(ports) != 0 {
-			hostname = dnsName
+			hostname = httpsHost
 		}
 		ing.Status.LoadBalancer.Ingress = []networkingv1.IngressLoadBalancerIngress{
 			{
@@ -485,7 +487,7 @@ func (r *HAIngressReconciler) maybeCleanupProxyGroup(ctx context.Context, logger
 			}
 
 			// Make sure the Tailscale Service is not advertised in tailscaled or serve config.
-			if err = r.maybeUpdateAdvertiseServicesConfig(ctx, tsSvcName, serviceAdvertisementOff, pg); err != nil {
+			if err = r.maybeUpdateAdvertiseServicesConfig(ctx, tsSvcName, serviceAdvertisementOff, pg, false); err != nil {
 				return false, fmt.Errorf("failed to update tailscaled config services: %w", err)
 			}
 
@@ -571,7 +573,7 @@ func (r *HAIngressReconciler) maybeCleanup(ctx context.Context, hostname string,
 	}
 
 	// 4. Unadvertise the Tailscale Service in tailscaled config.
-	if err = r.maybeUpdateAdvertiseServicesConfig(ctx, serviceName, serviceAdvertisementOff, pg); err != nil {
+	if err = r.maybeUpdateAdvertiseServicesConfig(ctx, serviceName, serviceAdvertisementOff, pg, false); err != nil {
 		return false, fmt.Errorf("failed to update tailscaled config services: %w", err)
 	}
 
@@ -646,6 +648,7 @@ func (r *HAIngressReconciler) shouldExpose(ing *networkingv1.Ingress) bool {
 // validateIngress validates that the Ingress is properly configured.
 // Currently validates:
 // - Any tags provided via tailscale.com/tags annotation are valid Tailscale ACL tags
+// - Any accept-app-caps provided via tailscale.com/accept-app-caps annotation are valid capability names
 // - The derived hostname is a valid DNS label
 // - The referenced ProxyGroup exists and is of type 'ingress'
 // - Ingress' TLS block is invalid
@@ -658,9 +661,21 @@ func (r *HAIngressReconciler) validateIngress(ctx context.Context, ing *networki
 		errs = append(errs, fmt.Errorf("Ingress contains invalid tags: %v", strings.Join(violations, ",")))
 	}
 
-	// Validate TLS configuration
-	if len(ing.Spec.TLS) > 0 && (len(ing.Spec.TLS) > 1 || len(ing.Spec.TLS[0].Hosts) > 1) {
-		errs = append(errs, fmt.Errorf("Ingress contains invalid TLS block %v: only a single TLS entry with a single host is allowed", ing.Spec.TLS))
+	// Validate accept-app-caps if present
+	if raw, ok := ing.Annotations[AnnotationAcceptAppCaps]; ok && raw != "" {
+		for _, p := range strings.Split(raw, ",") {
+			p = strings.TrimSpace(p)
+			if p != "" && !validAppCap.MatchString(p) {
+				errs = append(errs, fmt.Errorf("invalid app capability %q", p))
+			}
+		}
+	}
+
+	// Validate TLS configuration — allow multiple hosts in a single TLS entry
+	// (additional hosts beyond the first are served using the same custom cert).
+	// Only one TLS entry is allowed.
+	if len(ing.Spec.TLS) > 1 {
+		errs = append(errs, fmt.Errorf("Ingress contains invalid TLS block %v: only a single TLS entry is allowed (multiple hosts within one entry are OK)", ing.Spec.TLS))
 	}
 
 	// Validate that the hostname will be a valid DNS label
@@ -755,7 +770,7 @@ const (
 	serviceAdvertisementHTTPAndHTTPS                                 // Both ports 80 and 443 should be advertised
 )
 
-func (r *HAIngressReconciler) maybeUpdateAdvertiseServicesConfig(ctx context.Context, serviceName tailcfg.ServiceName, mode serviceAdvertisementMode, pg *tsapi.ProxyGroup) (err error) {
+func (r *HAIngressReconciler) maybeUpdateAdvertiseServicesConfig(ctx context.Context, serviceName tailcfg.ServiceName, mode serviceAdvertisementMode, pg *tsapi.ProxyGroup, customTLSReady bool) (err error) {
 	// Get all config Secrets for this ProxyGroup.
 	secrets := &corev1.SecretList{}
 	if err := r.List(ctx, secrets, client.InNamespace(r.tsNamespace), client.MatchingLabels(pgSecretLabels(pg.Name, kubetypes.LabelSecretTypeConfig))); err != nil {
@@ -775,7 +790,7 @@ func (r *HAIngressReconciler) maybeUpdateAdvertiseServicesConfig(ctx context.Con
 		return fmt.Errorf("error checking TLS credentials provisioned for service %q: %w", serviceName, err)
 	}
 	shouldBeAdvertised := (mode == serviceAdvertisementHTTPAndHTTPS) ||
-		(mode == serviceAdvertisementHTTPS && hasCert) // if we only expose port 443 and don't have certs (yet), do not advertise
+		(mode == serviceAdvertisementHTTPS && (hasCert || customTLSReady)) // if we only expose port 443 and don't have certs (yet), do not advertise
 
 	for _, secret := range secrets.Items {
 		var updated bool
@@ -937,14 +952,18 @@ func ownersAreSetAndEqual(a, b *tailscale.VIPService) bool {
 // (domain) is a valid Kubernetes resource name.
 // https://github.com/tailscale/tailscale/blob/8b1e7f646ee4730ad06c9b70c13e7861b964949b/util/dnsname/dnsname.go#L99
 // https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#dns-subdomain-names
-func (r *HAIngressReconciler) ensureCertResources(ctx context.Context, pg *tsapi.ProxyGroup, domain string, ing *networkingv1.Ingress) error {
+func (r *HAIngressReconciler) ensureCertResources(ctx context.Context, pg *tsapi.ProxyGroup, domain string, ing *networkingv1.Ingress, customTLS *ingressCustomTLS) error {
 	secret := certSecret(pg.Name, r.tsNamespace, domain, ing)
 	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, secret, func(s *corev1.Secret) {
 		// Labels might have changed if the Ingress has been updated to use a
 		// different ProxyGroup.
 		s.Labels = secret.Labels
+		s.Type = secret.Type
 	}); err != nil {
 		return fmt.Errorf("failed to create or update Secret %s: %w", secret.Name, err)
+	}
+	if err := ensureCustomTLSStateSecrets(ctx, r.Client, r.tsNamespace, pg, customTLS); err != nil {
+		return fmt.Errorf("failed to ensure custom TLS state Secrets: %w", err)
 	}
 	role := certSecretRole(pg.Name, r.tsNamespace, domain)
 	if _, err := createOrUpdate(ctx, r.Client, r.tsNamespace, role, func(r *rbacv1.Role) {
@@ -1046,18 +1065,15 @@ func certSecretRoleBinding(pg *tsapi.ProxyGroup, namespace, domain string) *rbac
 
 // certSecret creates a Secret that will store the TLS certificate and private
 // key for the given domain. Domain must be a valid Kubernetes resource name.
+
 func certSecret(pgName, namespace, domain string, parent client.Object) *corev1.Secret {
 	labels := certResourceLabels(pgName, domain)
 	labels[kubetypes.LabelSecretType] = kubetypes.LabelSecretTypeCerts
 	// Labels that let us identify the Ingress resource lets us reconcile
 	// the Ingress when the TLS Secret is updated (for example, when TLS
 	// certs have been provisioned).
-	labels[LabelParentType] = strings.ToLower(parent.GetObjectKind().GroupVersionKind().Kind)
-	labels[LabelParentName] = parent.GetName()
-	if ns := parent.GetNamespace(); ns != "" {
-		labels[LabelParentNamespace] = ns
-	}
-	return &corev1.Secret{
+	mkParentLabels(&labels, parent)
+	secret := &corev1.Secret{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "v1",
 			Kind:       "Secret",
@@ -1073,6 +1089,7 @@ func certSecret(pgName, namespace, domain string, parent client.Object) *corev1.
 		},
 		Type: corev1.SecretTypeTLS,
 	}
+	return secret
 }
 
 func certResourceLabels(pgName, domain string) map[string]string {
