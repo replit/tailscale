@@ -144,11 +144,14 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 			// The cert exists in the store but failed x509 chain or
 			// domain validation. For custom domain certs provided by
 			// the user (e.g., via Kubernetes Ingress spec.tls), serve
-			// the cert as-is — the user is responsible for ensuring
-			// the cert is valid for their domain. Only verify that
-			// the cert/key form a valid TLS keypair.
+			// the cert as-is if it's not time-expired — the user is
+			// responsible for ensuring the cert is valid for their
+			// domain. Only verify that the cert/key form a valid TLS
+			// keypair and the cert hasn't expired.
 			if pair, rawErr := cs.ReadRaw(domain); rawErr == nil {
-				return pair, nil
+				if crt, parseErr := pair.parseCertificate(); parseErr == nil && now.Before(crt.NotAfter) {
+					return pair, nil
+				}
 			}
 			return nil, cacheErr
 		} else if cacheErr != nil && !errors.Is(cacheErr, ipn.ErrStateNotExist) {
@@ -165,7 +168,7 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 		log.Printf("acme %T: %s", v, j)
 	}
 
-	if pair, err := getCertPEMCached(cs, certDomain, now); err == nil {
+	if pair, cacheErr := getCertPEMCached(cs, certDomain, now); cacheErr == nil {
 		if envknob.IsCertShareReadOnlyMode() {
 			return pair, nil
 		}
@@ -194,6 +197,21 @@ func (b *LocalBackend) GetCertPEMWithValidity(ctx context.Context, domain string
 		// If the caller requested a specific validity duration, fall through
 		// to synchronous renewal to fulfill that.
 		logf("starting sync renewal")
+	} else if !strings.HasSuffix(domain, ".ts.net") && errors.Is(cacheErr, errCertExpired) {
+		// The cert exists in the store but failed x509 chain or domain
+		// validation. For non-ts.net domains that are also in CertDomains
+		// (ACME-managed), still try serving the cert as a user-provided
+		// custom cert — the user is responsible for ensuring it's valid.
+		// This covers the case where a domain is both ACME-managed and has
+		// a custom cert from Ingress spec.tls that fails full x509
+		// validation (e.g., different CA, missing intermediates).
+		// Only serve if the cert is not actually time-expired, to avoid
+		// suppressing ACME renewal for genuinely expired certs.
+		if pair, rawErr := cs.ReadRaw(domain); rawErr == nil {
+			if crt, parseErr := pair.parseCertificate(); parseErr == nil && now.Before(crt.NotAfter) {
+				return pair, nil
+			}
+		}
 	}
 
 	if envknob.IsCertShareReadOnlyMode() {
